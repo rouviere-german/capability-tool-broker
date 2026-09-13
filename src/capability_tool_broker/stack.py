@@ -22,7 +22,7 @@ from opentelemetry.trace import Tracer
 from pydantic import JsonValue
 
 from capability_tool_broker.agentic.approval import ApprovalStore
-from capability_tool_broker.agentic.audit import AuditLog
+from capability_tool_broker.agentic.audit import AuditLog, FileCheckpointSink
 from capability_tool_broker.approver.service import DEFAULT_DISCHARGE_TTL_SECONDS, ApproverService
 from capability_tool_broker.authority.policy import Policy
 from capability_tool_broker.authority.service import Authority
@@ -192,7 +192,10 @@ def build_stack(
     tracer: Tracer | None = None,
     audit_name: str = "audit.jsonl",
     discharge_ttl_seconds: int = DEFAULT_DISCHARGE_TTL_SECONDS,
+    audit_checkpoint_key: bytes | None = None,
 ) -> Stack:
+    """Wire every component. With ``audit_checkpoint_key`` the audit log signs checkpoints into
+    ``<workdir>/checkpoints/<audit_name>.checkpoint``."""
     workdir.mkdir(parents=True, exist_ok=True)
     clock = clock or ManualClock()
     keys = keys or Keyset.generate()
@@ -200,7 +203,15 @@ def build_stack(
     body = manifest_body or default_manifest_body(issued_at=int(clock()))
     signed = sign_manifest(body, keys.manifest_private, MANIFEST_KEY_ID)
     manifest = ToolManifest.verify(signed, {MANIFEST_KEY_ID: keys.manifest_private.public_key()})
-    audit = AuditLog(workdir / audit_name)
+    audit = (
+        AuditLog(workdir / audit_name)
+        if audit_checkpoint_key is None
+        else AuditLog(
+            workdir / audit_name,
+            checkpoints=FileCheckpointSink(workdir / "checkpoints" / f"{audit_name}.checkpoint"),
+            checkpoint_key=audit_checkpoint_key,
+        )
+    )
     state = state or MemoryStateStore()
     credentials = keys.credentials()
 

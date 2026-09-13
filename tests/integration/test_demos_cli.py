@@ -42,7 +42,9 @@ def test_demo_contains_the_injection_and_runs_one_approved_write(tmp_path: Path)
     assert summary["replayed_discharge"] == "replayed"
     assert summary["discharge_on_other_request"] == "caveat_unmet"
     assert summary["audit_ok"] is True
+    assert summary["audit_checkpointed"] is True
     assert summary["tampered_copy_detected"] is True
+    assert summary["truncated_copy_detected"] is True
     denied = summary["denied"]
     assert isinstance(denied, list)
     assert [item["failed_caveat"] for item in denied] == [  # type: ignore[index,call-overload]

@@ -7,6 +7,7 @@ models. No network, no API key.
 
 from __future__ import annotations
 
+import secrets
 from collections.abc import Callable
 from pathlib import Path
 
@@ -25,7 +26,7 @@ from capability_tool_broker.agent.host import (
     ToolEvent,
 )
 from capability_tool_broker.agentic.approval import ApprovalStatus
-from capability_tool_broker.agentic.audit import verify_file
+from capability_tool_broker.agentic.audit import FileCheckpointSink, verify_file
 from capability_tool_broker.agentic.budget import BudgetLedger, BudgetLimits
 from capability_tool_broker.approver.cli import review_pending
 from capability_tool_broker.scenario import (
@@ -39,7 +40,9 @@ from capability_tool_broker.stack import ManualClock, Stack, build_stack
 __all__ = ["format_event", "run_demo"]
 
 _CLIENT_ID = "agent-host"
-_STALE = ("audit.jsonl", "audit.tampered.jsonl", "budget.json")
+_AUDIT = "audit.jsonl"
+_CHECKPOINT = f"checkpoints/{_AUDIT}.checkpoint"
+_STALE = (_AUDIT, _CHECKPOINT, "audit.tampered.jsonl", "audit.truncated.jsonl", "budget.json")
 
 
 def format_event(event: ToolEvent) -> str:
@@ -69,7 +72,13 @@ def run_demo(
     for name in _STALE:
         (workdir / name).unlink(missing_ok=True)
     clock = ManualClock()
-    stack = build_stack(workdir, clock=clock, invoices=demo_invoices())
+    stack = build_stack(
+        workdir,
+        clock=clock,
+        invoices=demo_invoices(),
+        audit_name=_AUDIT,
+        audit_checkpoint_key=secrets.token_bytes(32),
+    )
     try:
         return _run(stack, workdir, clock, interactive=interactive, out=out, ask=ask)
     finally:
@@ -164,7 +173,10 @@ def _run(  # noqa: PLR0915 - a linear narrative
         if reuse_caveat:
             out(f"          failing caveat: {reuse_caveat}")
 
-    verified = verify_file(stack.audit.path, expect_head=stack.audit.head)
+    # The log is checked against the checkpoint its writer signed after every append, not against
+    # its own in-memory head: a copy that lost its last entries still forms a valid chain.
+    checkpoint = FileCheckpointSink(workdir / _CHECKPOINT).latest()
+    verified = verify_file(stack.audit.path, checkpoint=checkpoint)
     lines = stack.audit.path.read_text(encoding="utf-8").splitlines(keepends=True)
     tampered_path = workdir / "audit.tampered.jsonl"
     tampered_path.write_text(
@@ -173,10 +185,17 @@ def _run(  # noqa: PLR0915 - a linear narrative
         newline="\n",
     )
     tampered = verify_file(tampered_path)
+    truncated_path = workdir / "audit.truncated.jsonl"
+    truncated_path.write_text("".join(lines[:-2]), encoding="utf-8", newline="\n")
+    truncated = verify_file(truncated_path, checkpoint=checkpoint)
+    checkpointed = checkpoint is not None
+    matches_checkpoint = verified.ok and checkpointed
     out(
-        f"[7] audit chain: {verified.entries} entries (mint, attenuate, deny, discharge, execute), "
-        f"verified={verified.ok}; edited copy detected={not tampered.ok} ({tampered.error})"
+        f"[7] audit chain: {verified.entries} entries (mint, attenuate, deny, discharge, "
+        f"authorize, execute), verified against its signed checkpoint={matches_checkpoint}"
     )
+    out(f"      edited copy detected={not tampered.ok} ({tampered.error})")
+    out(f"      copy missing the last 2 entries detected={not truncated.ok} ({truncated.error})")
 
     return {
         "task_id": minted.task_id,
@@ -198,9 +217,11 @@ def _run(  # noqa: PLR0915 - a linear narrative
         "replayed_discharge": replay_reason,
         "discharge_on_other_request": reuse_reason,
         "audit_ok": verified.ok,
+        "audit_checkpointed": checkpointed,
         "audit_entries": verified.entries,
         "audit_head": verified.head,
         "tampered_copy_detected": not tampered.ok,
+        "truncated_copy_detected": not truncated.ok,
         "budget_steps_used": budget.state.steps,
         "messages_sent": len(stack.mailer.outbox),
     }
