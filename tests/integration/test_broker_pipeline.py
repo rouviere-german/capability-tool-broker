@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import secrets
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
 import fakeredis
@@ -17,7 +17,7 @@ from pydantic import JsonValue, ValidationError
 
 from capability_tool_broker.agent.clients import InProcessApproverClient, InProcessBrokerClient
 from capability_tool_broker.agent.host import CapabilityRuntime, RuntimeContext
-from capability_tool_broker.agentic.audit import verify_file
+from capability_tool_broker.agentic.audit import AuditEntry, AuditLog, verify_file
 from capability_tool_broker.agentic.budget import BudgetLedger, BudgetLimits
 from capability_tool_broker.agentic.envelope import parse_envelopes
 from capability_tool_broker.agentic.providers.base import LLMResponse, ToolUseBlock
@@ -370,6 +370,59 @@ def test_the_broker_fails_closed(stack: Stack, tmp_path: Path) -> None:
     assert reason(with_base) == "upstream_error"
 
 
+class _FailingAudit(AuditLog):
+    """An audit log whose appends fail for the named actions (a full or unavailable disk)."""
+
+    def __init__(self, path: Path, failing: set[str]) -> None:
+        super().__init__(path)
+        self.failing = failing
+
+    def append(
+        self, actor: str, action: str, data: Mapping[str, JsonValue] | None = None
+    ) -> AuditEntry:
+        if action in self.failing:
+            raise OSError("no space left on device")
+        return super().append(actor, action, data)
+
+
+def test_no_effect_runs_unless_its_authorization_was_audited_first(
+    stack: Stack, tmp_path: Path
+) -> None:
+    token = mint(stack, "invoice-cleanup").token  # max_calls <= 5
+    audit = _FailingAudit(
+        tmp_path / "broker-audit.jsonl", {"broker.authorize", "broker.execute", "broker.deny"}
+    )
+    broker = _broker(stack, audit=audit)
+    read = ToolCall(task_id="task-1", tool="invoices_read", resource="invoice/42")
+    outcome = broker.call(token=token, call=read, client_id=CLIENT)
+    assert not outcome.allowed
+    assert outcome.reason == "audit_unavailable"
+    assert stack.invoices.effects == []
+    audit.failing.clear()
+    assert [broker.call(token=token, call=read, client_id=CLIENT).allowed for _ in range(6)] == [
+        True
+    ] * 5 + [False]  # the refused call consumed no quota
+
+
+def test_the_authorization_record_precedes_the_effect_and_survives_a_failed_outcome_record(
+    stack: Stack, tmp_path: Path
+) -> None:
+    token = mint(stack).token
+    audit = _FailingAudit(tmp_path / "broker-audit.jsonl", {"broker.execute"})
+    broker = _broker(stack, audit=audit)
+    read = ToolCall(task_id="task-1", tool="invoices_read", resource="invoice/42")
+    outcome = broker.call(token=token, call=read, client_id=CLIENT)
+    assert outcome.allowed  # the effect happened, so the caller still learns its result
+    assert len(stack.invoices.effects) == 1
+    entries = [json.loads(line) for line in audit.path.read_text(encoding="utf-8").splitlines()]
+    assert [entry["action"] for entry in entries] == ["broker.authorize"]
+    data = entries[0]["data"]
+    assert data["request_hash"] == outcome.request_hash
+    assert data["tool"] == "invoices_read"
+    assert data["claims"] == ["max_calls"]
+    assert data["token_id"]
+
+
 def test_large_outputs_are_capped(stack: Stack) -> None:
     stack.files.files["notes.txt"] = "x" * 6000
     token = mint(stack, "file-maintenance").token
@@ -402,9 +455,11 @@ def test_decisions_are_audited_with_the_failing_caveat(stack: Stack) -> None:
         "broker.deny",
         "approver.requested",
         "approver.discharge",
+        "broker.authorize",
         "broker.execute",
     ):
         assert expected in actions
+    assert actions.index("broker.authorize") < actions.index("broker.execute")
     first_deny = next(entry for entry in entries if entry["action"] == "broker.deny")
     assert first_deny["data"]["failed_caveat"] == "resource matches invoice/42"
     assert verify_file(stack.audit.path, expect_head=stack.audit.head).ok

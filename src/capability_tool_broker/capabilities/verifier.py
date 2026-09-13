@@ -94,6 +94,7 @@ class DenyReason(StrEnum):
     EXHAUSTED = "exhausted"
     REPLAYED = "replayed"
     STATE_UNAVAILABLE = "state_unavailable"
+    AUDIT_UNAVAILABLE = "audit_unavailable"
     UPSTREAM_ERROR = "upstream_error"
 
 

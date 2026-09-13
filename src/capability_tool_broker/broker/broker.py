@@ -9,11 +9,15 @@ For each call, in order:
 4. Check the manifest's required caveat types and, for write and delete verbs, require approval
    evidence: a discharge of an authority-tagged approval caveat that carries ``request_hash`` for
    this exact request and a ``once`` nonce.
-5. Check the revocation denylist, then atomically commit ``max_calls`` counters and ``once`` nonces.
-6. Inject the service credential, sign the upstream request, call the service, cap the output and
-   wrap it as untrusted data.
+5. Write a ``broker.authorize`` record (request hash, token id, claims) to the audit log. If it
+   cannot be written the call is denied with ``audit_unavailable``: no effect ever runs without
+   a record of its authorization.
+6. Check the revocation denylist, then atomically commit ``max_calls`` counters and ``once`` nonces.
+7. Inject the service credential, sign the upstream request, call the service, cap the output and
+   wrap it as untrusted data, then record the outcome (``broker.execute``). A failure to record
+   the outcome is logged and does not hide the result of an effect that already happened.
 
-Steps 4 and 5 run after every stateless check, so a denied call never consumes quota or burns an
+Steps 4 to 6 run after every stateless check, so a denied call never consumes quota or burns an
 approval. Every decision is counted, timed, traced and written to the hash-chained audit log.
 """
 
@@ -31,6 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from capability_tool_broker.agentic.audit import AuditLog
 from capability_tool_broker.agentic.envelope import wrap_tool_result
+from capability_tool_broker.agentic.errors import AuditIntegrityError
 from capability_tool_broker.broker.manifest import ManifestHolder, ToolEntry
 from capability_tool_broker.broker.observability import BrokerMetrics, create_broker_metrics
 from capability_tool_broker.broker.signing import ServiceCredential, sign_request
@@ -312,6 +317,27 @@ class Broker:
             raise RuntimeError(
                 "authorized decisions carry the resolved request"
             )  # pragma: no cover
+        recorded = self._audit_append(
+            client_id or "anonymous",
+            "broker.authorize",
+            {
+                "tool": call.tool,
+                "task_id": call.task_id,
+                "resource": call.resource,
+                "request_hash": decision.request.request_hash(),
+                "token_id": decision.token_id,
+                "claims": [claim.kind for claim in result.claims],
+                "discharges": len(result.discharges),
+            },
+        )
+        if not recorded:
+            return self._deny(
+                Denial(DenyReason.AUDIT_UNAVAILABLE, "the authorization could not be audited"),
+                call=call,
+                client_id=client_id,
+                request=decision.request,
+                token_id=decision.token_id,
+            )
         stateful = self._commit_state(result, decision.token_id, decision.now)
         if stateful is not None:
             return self._deny(
@@ -490,6 +516,13 @@ class Broker:
             canonical_request=request,
         )
 
-    def _audit_append(self, actor: str, action: str, data: dict[str, JsonValue]) -> None:
-        if self._audit is not None:
+    def _audit_append(self, actor: str, action: str, data: dict[str, JsonValue]) -> bool:
+        """Append a record; False (and an error log) if the audit log cannot be written."""
+        if self._audit is None:
+            return True
+        try:
             self._audit.append(actor, action, data)
+        except (OSError, AuditIntegrityError) as exc:
+            _log.error("audit_append_failed", action=action, error_type=type(exc).__name__)
+            return False
+        return True
