@@ -423,6 +423,63 @@ def test_the_authorization_record_precedes_the_effect_and_survives_a_failed_outc
     assert data["token_id"]
 
 
+def _failing_http(error: type[httpx.TransportError]) -> httpx.Client:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error("service unavailable", request=request)
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_calls_that_never_reached_the_service_give_back_quota_and_approval(stack: Stack) -> None:
+    state = MemoryStateStore()
+    refused = _broker(stack, state=state, http=_failing_http(httpx.ConnectError))
+    no_credential = _broker(stack, state=state, credentials={})
+    working = _broker(stack, state=state)
+    token = mint(stack).token
+    bound = bind(
+        token, approve(stack, call(stack, token, "invoices_update_status", "invoice/42", STATUS))
+    )
+    write = ToolCall(
+        task_id="task-1", tool="invoices_update_status", resource="invoice/42", args=STATUS
+    )
+
+    def attempt(broker: Broker) -> str:
+        return broker.call(token=token, discharges=[bound], call=write, client_id=CLIENT).reason
+
+    assert attempt(refused) == "upstream_error"
+    assert attempt(no_credential) == "upstream_error"
+    assert attempt(working) == "ok"  # the approval was not burned by calls that sent nothing
+    assert attempt(working) == "replayed"
+    assert [effect.kind for effect in stack.invoices.effects] == ["write"]
+
+    reads = mint(stack, "invoice-cleanup").token  # max_calls <= 5
+    read = ToolCall(task_id="task-1", tool="invoices_read", resource="invoice/42")
+    for _ in range(3):
+        assert refused.call(token=reads, call=read, client_id=CLIENT).reason == "upstream_error"
+    outcomes = [working.call(token=reads, call=read, client_id=CLIENT).reason for _ in range(6)]
+    assert outcomes == ["ok"] * 5 + ["exhausted"]
+
+
+def test_ambiguous_upstream_failures_keep_the_approval_consumed(stack: Stack) -> None:
+    state = MemoryStateStore()
+    timed_out = _broker(stack, state=state, http=_failing_http(httpx.ReadTimeout))
+    working = _broker(stack, state=state)
+    token = mint(stack).token
+    bound = bind(
+        token, approve(stack, call(stack, token, "invoices_update_status", "invoice/42", STATUS))
+    )
+    write = ToolCall(
+        task_id="task-1", tool="invoices_update_status", resource="invoice/42", args=STATUS
+    )
+    assert timed_out.call(token=token, discharges=[bound], call=write, client_id=CLIENT).reason == (
+        "upstream_error"
+    )
+    # The request may have reached the service, so the single-use approval stays spent.
+    assert working.call(token=token, discharges=[bound], call=write, client_id=CLIENT).reason == (
+        "replayed"
+    )
+
+
 def test_large_outputs_are_capped(stack: Stack) -> None:
     stack.files.files["notes.txt"] = "x" * 6000
     token = mint(stack, "file-maintenance").token

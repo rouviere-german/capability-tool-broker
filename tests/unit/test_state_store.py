@@ -179,6 +179,21 @@ def test_redis_commits_never_shorten_a_keys_lifetime() -> None:
     assert store.count("q") == 2
 
 
+def test_release_gives_back_counters_and_nonces_but_never_goes_negative(
+    store: StateStore,
+) -> None:
+    claims = [counter("r", 1, NOW + 60), once("m", NOW + 60)]
+    assert store.commit(claims, now=NOW).ok
+    assert not store.commit(claims, now=NOW).ok
+    store.release(claims, now=NOW)
+    assert store.count("r") == 0
+    assert store.commit(claims, now=NOW).ok
+    assert store.commit([counter("r", 1, NOW + 60)], now=NOW).reason == "exhausted"
+    store.release([counter("never-used", 3)], now=NOW)
+    store.release([], now=NOW)
+    assert store.count("never-used") == 0
+
+
 def test_redis_outages_fail_closed() -> None:
     server = fakeredis.FakeServer()
     server.connected = False
@@ -186,6 +201,8 @@ def test_redis_outages_fail_closed() -> None:
     assert not store.ping()
     with pytest.raises(StateUnavailableError):
         store.commit([counter("k", 1)], now=NOW)
+    with pytest.raises(StateUnavailableError):
+        store.release([counter("k", 1), once("n")], now=NOW)
     with pytest.raises(StateUnavailableError):
         store.revoke("t", until=None, now=NOW)
     with pytest.raises(StateUnavailableError):
@@ -206,3 +223,6 @@ def test_redis_contention_is_reported_after_bounded_retries(
     monkeypatch.setattr(redis.client.Pipeline, "execute", always_conflict)
     assert store.commit([counter("k", 5)], now=NOW) == CommitResult(False, "contention")
     assert len(attempts) == 3
+    with pytest.raises(StateUnavailableError, match="contention"):
+        store.release([counter("k", 5)], now=NOW)
+    assert len(attempts) == 6

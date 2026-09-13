@@ -52,6 +52,14 @@ class StateStore(Protocol):
 
     def commit(self, claims: Sequence[StateClaim], *, now: int) -> CommitResult: ...
 
+    def release(self, claims: Sequence[StateClaim], *, now: int) -> None:
+        """Give back committed claims of a call that provably never reached its service.
+
+        Counters are decremented (never below zero) and once-keys forgotten. The broker calls this
+        only when no connection to the service was established, never for ambiguous failures.
+        """
+        ...
+
     def revoke(self, token_nonce: str, *, until: int | None, now: int) -> None: ...
 
     def is_revoked(self, token_nonce: str, *, now: int) -> bool: ...
@@ -130,6 +138,16 @@ class MemoryStateStore:
         value, expiry = self._counters.get(key, (0, None))
         return value if self._live(expiry, now) else 0
 
+    def release(self, claims: Sequence[StateClaim], *, now: int) -> None:
+        with self._lock:
+            for claim in claims:
+                if claim.kind == "max_calls":
+                    value, expiry = self._counters.get(claim.key, (0, None))
+                    if value > 0 and self._live(expiry, now):
+                        self._counters[claim.key] = (value - 1, expiry)
+                else:
+                    self._once.pop(claim.key, None)
+
     def revoke(self, token_nonce: str, *, until: int | None, now: int) -> None:
         with self._lock:
             self._revoked[token_nonce] = _expiry(until, now)
@@ -200,6 +218,32 @@ class RedisStateStore:
         except redis.RedisError as exc:
             raise StateUnavailableError("state store unavailable") from exc
         return CommitResult(False, "contention")
+
+    def release(self, claims: Sequence[StateClaim], *, now: int) -> None:
+        del now  # Redis expires keys itself
+        counters = [self._counter_key(c.key) for c in claims if c.kind == "max_calls"]
+        onces = [self._once_key(c.key) for c in claims if c.kind == "once"]
+        if not counters and not onces:
+            return
+        try:
+            for _ in range(self._max_retries):
+                with self._client.pipeline() as pipe:
+                    try:
+                        pipe.watch(*counters, *onces)  # type: ignore[no-untyped-call]
+                        values = [int(pipe.get(key) or 0) for key in counters]
+                        pipe.multi()
+                        for key, value in zip(counters, values, strict=True):
+                            if value > 0:
+                                pipe.decr(key)
+                        if onces:
+                            pipe.delete(*onces)
+                        pipe.execute()
+                    except redis.WatchError:
+                        continue
+                    return
+        except redis.RedisError as exc:
+            raise StateUnavailableError("state store unavailable") from exc
+        raise StateUnavailableError("state store contention")
 
     def revoke(self, token_nonce: str, *, until: int | None, now: int) -> None:
         try:

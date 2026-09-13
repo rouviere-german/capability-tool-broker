@@ -15,7 +15,10 @@ For each call, in order:
 6. Check the revocation denylist, then atomically commit ``max_calls`` counters and ``once`` nonces.
 7. Inject the service credential, sign the upstream request, call the service, cap the output and
    wrap it as untrusted data, then record the outcome (``broker.execute``). A failure to record
-   the outcome is logged and does not hide the result of an effect that already happened.
+   the outcome is logged and does not hide the result of an effect that already happened. When
+   no connection to the service could be established (or no credential is configured), nothing
+   reached the service, so the committed counters and once-keys are released; any other upstream
+   failure keeps them spent.
 
 Steps 4 to 6 run after every stateless check, so a denied call never consumes quota or burns an
 approval. Every decision is counted, timed, traced and written to the hash-chained audit log.
@@ -55,6 +58,7 @@ from capability_tool_broker.capabilities.verifier import (
     Denial,
     DenyReason,
     MacaroonVerifier,
+    StateClaim,
 )
 from capability_tool_broker.core.canonical import canonical_json, sha256_hex
 from capability_tool_broker.core.logging import get_logger
@@ -354,6 +358,7 @@ class Broker:
             client_id=client_id,
             token_id=decision.token_id,
             now=decision.now,
+            claims=result.claims,
         )
 
     def _canonical(
@@ -444,10 +449,12 @@ class Broker:
         client_id: str | None,
         token_id: str | None,
         now: int,
+        claims: Sequence[StateClaim],
     ) -> BrokerOutcome:
         request_hash = request.request_hash()
         credential = self._credentials.get(entry.service)
         if credential is None:
+            self._release(claims, now)
             return self._upstream_failure(request, client_id, "no credential for service")
         body = b"" if entry.method in {"GET", "DELETE"} else canonical_json(request.args).encode()
         headers = sign_request(credential, method=entry.method, path=path, body=body, now=now)
@@ -470,8 +477,14 @@ class Broker:
                         del captured[entry.max_output_bytes :]
                         break
                 status = response.status_code
-        except httpx.HTTPError:
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            # No connection was established, so no byte of the request reached the service: the
+            # quota and single-use approval this call committed are given back.
+            self._release(claims, now)
             return self._upstream_failure(request, client_id, "upstream service unreachable")
+        except httpx.HTTPError:
+            # The request may have reached the service: its claims stay spent (fail closed).
+            return self._upstream_failure(request, client_id, "upstream request failed")
         text = captured.decode("utf-8", errors="replace")
         envelope = wrap_tool_result(entry.name, text).render()
         self.metrics.decisions_total.labels("allow", "none").inc()
@@ -498,6 +511,14 @@ class Broker:
             output=envelope,
             truncated=truncated,
         )
+
+    def _release(self, claims: Sequence[StateClaim], now: int) -> None:
+        if not claims:
+            return
+        try:
+            self._state.release(claims, now=now)
+        except StateUnavailableError:
+            _log.error("state_release_failed", claims=len(claims))  # the claims stay spent
 
     def _upstream_failure(
         self, request: CanonicalRequest, client_id: str | None, detail: str
