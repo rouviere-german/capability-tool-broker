@@ -513,8 +513,6 @@ class Broker:
         )
 
     def _release(self, claims: Sequence[StateClaim], now: int) -> None:
-        if not claims:
-            return
         try:
             self._state.release(claims, now=now)
         except StateUnavailableError:

@@ -480,6 +480,19 @@ def test_ambiguous_upstream_failures_keep_the_approval_consumed(stack: Stack) ->
     )
 
 
+class _UnreleasableState(MemoryStateStore):
+    def release(self, claims: Sequence[StateClaim], *, now: int) -> None:
+        raise StateUnavailableError("down")
+
+
+def test_a_failed_release_leaves_the_claims_spent(stack: Stack) -> None:
+    broker = _broker(stack, state=_UnreleasableState(), credentials={})
+    token = mint(stack, "invoice-cleanup").token  # max_calls <= 5
+    read = ToolCall(task_id="task-1", tool="invoices_read", resource="invoice/42")
+    reasons = [broker.call(token=token, call=read, client_id=CLIENT).reason for _ in range(6)]
+    assert reasons == ["upstream_error"] * 5 + ["exhausted"]
+
+
 def test_large_outputs_are_capped(stack: Stack) -> None:
     stack.files.files["notes.txt"] = "x" * 6000
     token = mint(stack, "file-maintenance").token

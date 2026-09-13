@@ -311,3 +311,8 @@ def test_verify_cli_checks_a_checkpoint_file(
     path.write_text("".join(lines_of(path)[:2]), encoding="utf-8", newline="\n")
     assert main(["verify", str(path), "--checkpoint", str(sink)]) == 1
     assert "behind its last checkpoint" in json.loads(capsys.readouterr().out)["error"]
+    assert main(["verify", str(path), "--checkpoint", str(tmp_path / "missing.checkpoint")]) == 1
+    assert json.loads(capsys.readouterr().out)["error"] == "checkpoint not found"
+    sink.write_text("{}", encoding="utf-8")
+    assert main(["verify", str(path), "--checkpoint", str(sink)]) == 1
+    assert "checkpoint is unreadable" in json.loads(capsys.readouterr().out)["error"]
