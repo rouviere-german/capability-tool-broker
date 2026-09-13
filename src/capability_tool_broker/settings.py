@@ -7,6 +7,11 @@ test_no_ambient_authority.py`` checks both the classes and the compose file.
 
 HTTP hygiene settings (bind address, rate limits, body size, CORS, docs) stay in
 :class:`capability_tool_broker.core.config.Settings` under the ``APP_`` prefix.
+
+Audit checkpoints: with ``*_AUDIT_CHECKPOINT_KEY`` set (base64url, at least 32 bytes) a role
+signs a checkpoint after every audit append and refuses to open a log that is behind or does not
+match its latest checkpoint. ``*_AUDIT_CHECKPOINT_PATH`` should point at storage the log writer
+cannot rewrite; it defaults to ``checkpoints/<log name>.checkpoint`` next to the log.
 """
 
 from __future__ import annotations
@@ -36,6 +41,8 @@ class AuthoritySettings(BaseSettings):
     client_public_keys: str
     policy_path: Path | None = None
     audit_path: Path = Path("var/authority-audit.jsonl")
+    audit_checkpoint_key: SecretStr | None = None
+    audit_checkpoint_path: Path | None = None
     audience: str = "authority"
 
 
@@ -52,6 +59,8 @@ class BrokerSettings(BaseSettings):
     redis_url: SecretStr | None = None
     client_public_keys: str
     audit_path: Path = Path("var/broker-audit.jsonl")
+    audit_checkpoint_key: SecretStr | None = None
+    audit_checkpoint_path: Path | None = None
     audience: str = "broker"
 
 
@@ -64,6 +73,8 @@ class ApproverSettings(BaseSettings):
     client_public_keys: str
     store_path: Path = Path("var/approvals.json")
     audit_path: Path = Path("var/approver-audit.jsonl")
+    audit_checkpoint_key: SecretStr | None = None
+    audit_checkpoint_path: Path | None = None
     discharge_ttl_seconds: int = Field(default=120, ge=10, le=900)
     reviewer: str = "human:reviewer"
     audience: str = "approver"

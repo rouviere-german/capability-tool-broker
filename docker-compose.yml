@@ -17,6 +17,9 @@
 # BROKER_REDIS_URL; Redis reads it from a private tmpfs file, not from its command line.
 #
 # Audit logs and the approval queue live on named volumes, so they survive container restarts.
+# Each auditing role signs a checkpoint of its log after every append (key from keygen) and keeps
+# it on a separate volume; a restarted role refuses a log that is behind or does not match its
+# checkpoint. Separate volumes do not protect against a compromise of the role's container.
 # The Redis image is pinned by digest (redis:7.4-alpine, resolved 2026-09-13).
 
 x-hardening: &hardening
@@ -90,8 +93,11 @@ services:
       AUTHORITY_APPROVER_PUBLIC_KEY: ${AUTHORITY_APPROVER_PUBLIC_KEY:?run keygen first}
       AUTHORITY_CLIENT_PUBLIC_KEYS: ${AUTHORITY_CLIENT_PUBLIC_KEYS:?run keygen first}
       AUTHORITY_AUDIT_PATH: /var/lib/ctb/authority-audit.jsonl
+      AUTHORITY_AUDIT_CHECKPOINT_KEY: ${AUTHORITY_AUDIT_CHECKPOINT_KEY:?run keygen first}
+      AUTHORITY_AUDIT_CHECKPOINT_PATH: /var/lib/ctb-checkpoints/authority-audit.checkpoint
     volumes:
       - authority-data:/var/lib/ctb
+      - authority-checkpoints:/var/lib/ctb-checkpoints
 
   approver:
     <<: *app
@@ -107,8 +113,11 @@ services:
       APPROVER_CLIENT_PUBLIC_KEYS: ${APPROVER_CLIENT_PUBLIC_KEYS:?run keygen first}
       APPROVER_STORE_PATH: /var/lib/ctb/approvals.json
       APPROVER_AUDIT_PATH: /var/lib/ctb/approver-audit.jsonl
+      APPROVER_AUDIT_CHECKPOINT_KEY: ${APPROVER_AUDIT_CHECKPOINT_KEY:?run keygen first}
+      APPROVER_AUDIT_CHECKPOINT_PATH: /var/lib/ctb-checkpoints/approver-audit.checkpoint
     volumes:
       - approver-data:/var/lib/ctb
+      - approver-checkpoints:/var/lib/ctb-checkpoints
 
   broker:
     <<: *app
@@ -133,9 +142,12 @@ services:
       BROKER_SERVICE_BASE_URL: http://services:8090
       BROKER_REDIS_URL: redis://:${REDIS_PASSWORD:?run keygen first}@redis:6379/0
       BROKER_AUDIT_PATH: /var/lib/ctb/broker-audit.jsonl
+      BROKER_AUDIT_CHECKPOINT_KEY: ${BROKER_AUDIT_CHECKPOINT_KEY:?run keygen first}
+      BROKER_AUDIT_CHECKPOINT_PATH: /var/lib/ctb-checkpoints/broker-audit.checkpoint
     volumes:
       - ./deploy/local/manifest.signed.json:/run/manifest/manifest.signed.json:ro
       - broker-data:/var/lib/ctb
+      - broker-checkpoints:/var/lib/ctb-checkpoints
 
   agent-host:
     <<: *app
@@ -166,5 +178,8 @@ networks:
 volumes:
   agent-state:
   authority-data:
+  authority-checkpoints:
   approver-data:
+  approver-checkpoints:
   broker-data:
+  broker-checkpoints:

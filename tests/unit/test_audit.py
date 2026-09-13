@@ -10,7 +10,14 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from capability_tool_broker.agentic.audit import AuditLog, main, verify_file
+from capability_tool_broker.agentic.audit import (
+    GENESIS_HASH,
+    AuditCheckpoint,
+    AuditLog,
+    FileCheckpointSink,
+    main,
+    verify_file,
+)
 from capability_tool_broker.agentic.errors import AuditIntegrityError
 from capability_tool_broker.core.canonical import canonical_json, sha256_hex
 
@@ -209,3 +216,98 @@ def test_verify_cli_exit_codes(tmp_path: Path, capsys: pytest.CaptureFixture[str
     report = json.loads(capsys.readouterr().out)
     assert report["ok"] is False
     assert report["line"] == 2
+
+
+CHECKPOINT_KEY = b"c" * 32
+
+
+def checkpointed(path: Path, sink: Path, entries: int) -> AuditLog:
+    log = AuditLog(
+        path,
+        clock=fixed_clock(),
+        checkpoints=FileCheckpointSink(sink),
+        checkpoint_key=CHECKPOINT_KEY,
+    )
+    for index in range(entries):
+        log.append("agent:test", "step", {"index": index, "note": f"entry {index}"})
+    return log
+
+
+def reopen(path: Path, sink: Path) -> AuditLog:
+    return AuditLog(path, checkpoints=FileCheckpointSink(sink), checkpoint_key=CHECKPOINT_KEY)
+
+
+def test_a_log_behind_its_checkpoint_is_refused(tmp_path: Path) -> None:
+    path, sink = tmp_path / "audit.jsonl", tmp_path / "anchor" / "audit.checkpoint"
+    log = checkpointed(path, sink, 5)
+    latest = FileCheckpointSink(sink).latest()
+    assert latest is not None
+    assert (latest.seq, latest.head) == (5, log.head)
+    path.write_text("".join(lines_of(path)[:3]), encoding="utf-8", newline="\n")
+    assert verify_file(path).ok  # the shorter chain is consistent on its own
+    with pytest.raises(AuditIntegrityError, match="behind its last checkpoint"):
+        reopen(path, sink)
+    report = verify_file(path, checkpoint=latest)
+    assert not report.ok
+    assert report.error == "log is behind its last checkpoint (truncated or rolled back)"
+    path.unlink()  # deleting the whole log is a rollback too
+    with pytest.raises(AuditIntegrityError, match="behind its last checkpoint"):
+        reopen(path, sink)
+
+
+def test_a_rewritten_log_that_does_not_match_its_checkpoint_is_refused(tmp_path: Path) -> None:
+    path, sink = tmp_path / "audit.jsonl", tmp_path / "anchor" / "audit.checkpoint"
+    checkpointed(path, sink, 3)
+    forged = tmp_path / "forged.jsonl"
+    forger = AuditLog(forged, clock=fixed_clock())
+    for index in range(4):
+        forger.append("agent:forger", "step", {"index": index})
+    path.write_bytes(forged.read_bytes())  # a longer, internally valid chain
+    with pytest.raises(AuditIntegrityError, match="does not match its last checkpoint"):
+        reopen(path, sink)
+    latest = FileCheckpointSink(sink).latest()
+    assert latest is not None
+    assert verify_file(path, checkpoint=latest).error == (
+        "log does not match its last checkpoint (history rewritten)"
+    )
+
+
+def test_checkpoints_are_signed_bound_to_their_log_and_never_move_backwards(
+    tmp_path: Path,
+) -> None:
+    path, sink_path = tmp_path / "audit.jsonl", tmp_path / "anchor" / "audit.checkpoint"
+    log = checkpointed(path, sink_path, 2)
+    sink = FileCheckpointSink(sink_path)
+    latest = sink.latest()
+    assert latest is not None
+    assert latest.verify(CHECKPOINT_KEY)
+    assert not latest.verify(b"x" * 32)
+    sink.publish(AuditCheckpoint.sign("audit.jsonl", 1, GENESIS_HASH, CHECKPOINT_KEY))
+    assert sink.latest() == latest  # an older checkpoint never replaces a newer one
+    reopened = reopen(path, sink_path)
+    assert reopened.append("agent:test", "step", {"index": 2}).seq == 2
+    assert (sink.latest() or latest).seq == 3
+    for forged, error in (
+        (AuditCheckpoint.sign("audit.jsonl", 0, GENESIS_HASH, b"x" * 32), "checkpoint signature"),
+        (AuditCheckpoint.sign("other.jsonl", 3, log.head, CHECKPOINT_KEY), "another log"),
+    ):
+        sink_path.write_text(forged.model_dump_json(), encoding="utf-8")
+        with pytest.raises(AuditIntegrityError, match=error):
+            reopen(path, sink_path)
+    sink_path.write_text("not a checkpoint", encoding="utf-8")
+    with pytest.raises(AuditIntegrityError, match="checkpoint is unreadable"):
+        reopen(path, sink_path)
+    with pytest.raises(ValueError, match="together"):
+        AuditLog(path, checkpoints=sink)
+
+
+def test_verify_cli_checks_a_checkpoint_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path, sink = tmp_path / "audit.jsonl", tmp_path / "audit.checkpoint"
+    checkpointed(path, sink, 3)
+    assert main(["verify", str(path), "--checkpoint", str(sink)]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+    path.write_text("".join(lines_of(path)[:2]), encoding="utf-8", newline="\n")
+    assert main(["verify", str(path), "--checkpoint", str(sink)]) == 1
+    assert "behind its last checkpoint" in json.loads(capsys.readouterr().out)["error"]

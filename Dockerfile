@@ -26,12 +26,12 @@ FROM ${PYTHON_IMAGE} AS runtime
 LABEL org.opencontainers.image.title="capability-tool-broker" \
       org.opencontainers.image.description="Capability broker for agent tools (authority, broker, approver, fake services)" \
       org.opencontainers.image.licenses="MIT"
-# /var/lib/ctb holds audit logs and the approval queue; compose mounts a named volume there, which
-# Docker initializes with this directory's ownership.
+# /var/lib/ctb holds audit logs and the approval queue, /var/lib/ctb-checkpoints the signed audit
+# checkpoints; compose mounts named volumes there, which Docker initializes with this ownership.
 RUN groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --no-create-home --home-dir /nonexistent \
        --shell /usr/sbin/nologin app \
-    && install -d -o 10001 -g 10001 -m 0750 /var/lib/ctb
+    && install -d -o 10001 -g 10001 -m 0750 /var/lib/ctb /var/lib/ctb-checkpoints
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \

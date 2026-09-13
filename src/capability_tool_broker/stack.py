@@ -49,6 +49,7 @@ from capability_tool_broker.capabilities.sealed import (
     public_key_text,
 )
 from capability_tool_broker.deploy import default_manifest_body, default_policy
+from capability_tool_broker.macaroons.codec import b64u_encode
 from capability_tool_broker.services.base import ServiceRouter
 from capability_tool_broker.services.files import FileStoreService
 from capability_tool_broker.services.invoices import InvoiceService
@@ -57,6 +58,7 @@ from capability_tool_broker.services.mailer import MailerService
 __all__ = ["Keyset", "ManualClock", "Stack", "build_stack"]
 
 SERVICE_NAMES = ("files", "invoices", "mailer")
+AUDITING_ROLES = ("authority", "broker", "approver")
 MANIFEST_KEY_ID = "manifest-k1"
 
 
@@ -82,6 +84,10 @@ class Keyset:
     service_secrets: dict[str, bytes]
     # Compose only: Redis requires it, and only the broker's BROKER_REDIS_URL carries it.
     redis_password: str = field(default_factory=lambda: secrets.token_urlsafe(32))
+    # One key per auditing role, for signed audit checkpoints.
+    audit_checkpoint_keys: dict[str, bytes] = field(
+        default_factory=lambda: {role: generate_secret() for role in AUDITING_ROLES}
+    )
 
     def __repr__(self) -> str:
         return f"Keyset(kids={self.ring.kids}, clients={sorted(self.client_keys)})"
@@ -114,7 +120,11 @@ class Keyset:
         )
         services = secret_map_text(self.service_secrets)
         agent_client, agent_key = next(iter(sorted(self.client_keys.items())))
-        return {
+        checkpoint = {
+            role: {f"{role.upper()}_AUDIT_CHECKPOINT_KEY": b64u_encode(key)}
+            for role, key in self.audit_checkpoint_keys.items()
+        }
+        environment = {
             "authority": {
                 "AUTHORITY_ROOT_KEYS": self.ring.to_spec(),
                 "AUTHORITY_APPROVER_PUBLIC_KEY": approver_public,
@@ -140,6 +150,9 @@ class Keyset:
                 "MANIFEST_SIGNING_KEY": ed25519_private_text(self.manifest_private),
             },
         }
+        for role, variables in checkpoint.items():
+            environment[role].update(variables)
+        return environment
 
 
 @dataclass

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import redis
 from fastapi import FastAPI
+from pydantic import SecretStr
 
 from capability_tool_broker.agentic.approval import ApprovalStore
-from capability_tool_broker.agentic.audit import AuditLog
+from capability_tool_broker.agentic.audit import AuditLog, FileCheckpointSink
 from capability_tool_broker.approver.app import create_approver_app
 from capability_tool_broker.approver.service import ApproverService
 from capability_tool_broker.authority.app import create_authority_app
@@ -20,10 +23,11 @@ from capability_tool_broker.broker.manifest import ManifestHolder
 from capability_tool_broker.broker.signing import ServiceCredential
 from capability_tool_broker.broker.state import MemoryStateStore, RedisStateStore, StateStore
 from capability_tool_broker.capabilities.keyfiles import parse_public_key_map, parse_secret_map
-from capability_tool_broker.capabilities.keys import RootKeyRing
+from capability_tool_broker.capabilities.keys import MIN_KEY_BYTES, RootKeyRing
 from capability_tool_broker.capabilities.sealed import load_private_key, load_public_key
 from capability_tool_broker.core.config import Settings
 from capability_tool_broker.deploy import default_policy
+from capability_tool_broker.macaroons.codec import b64u_decode
 from capability_tool_broker.services.base import ServiceRouter
 from capability_tool_broker.services.files import FileStoreService
 from capability_tool_broker.services.invoices import InvoiceService
@@ -37,6 +41,7 @@ from capability_tool_broker.settings import (
 
 __all__ = [
     "ROLES",
+    "audit_log",
     "build_app",
     "build_approver_service",
     "build_authority_app",
@@ -55,6 +60,21 @@ def service_credentials(spec: str) -> dict[str, ServiceCredential]:
     }
 
 
+def audit_log(
+    path: Path, checkpoint_key: SecretStr | None, checkpoint_path: Path | None
+) -> AuditLog:
+    """A role's audit log, with signed checkpoints when a checkpoint key is configured."""
+    if checkpoint_key is None:
+        if checkpoint_path is not None:
+            raise ValueError("an audit checkpoint path needs an audit checkpoint key")
+        return AuditLog(path)
+    key = b64u_decode(checkpoint_key.get_secret_value())
+    if len(key) < MIN_KEY_BYTES:
+        raise ValueError(f"the audit checkpoint key must be at least {MIN_KEY_BYTES} bytes")
+    sink_path = checkpoint_path or path.parent / "checkpoints" / f"{path.name}.checkpoint"
+    return AuditLog(path, checkpoints=FileCheckpointSink(sink_path), checkpoint_key=key)
+
+
 def build_authority_app(role: AuthoritySettings, settings: Settings) -> FastAPI:
     ring = RootKeyRing.parse(role.root_keys.get_secret_value())
     policy = Policy.load(role.policy_path) if role.policy_path else default_policy()
@@ -62,7 +82,7 @@ def build_authority_app(role: AuthoritySettings, settings: Settings) -> FastAPI:
         ring=ring,
         policy=policy,
         approver_public_key=load_public_key(role.approver_public_key),
-        audit=AuditLog(role.audit_path),
+        audit=audit_log(role.audit_path, role.audit_checkpoint_key, role.audit_checkpoint_path),
     )
     verifier = ClientAssertionVerifier(
         parse_public_key_map(role.client_public_keys), audience=role.audience
@@ -84,7 +104,7 @@ def build_broker_app(role: BrokerSettings, settings: Settings) -> FastAPI:
         state=state,
         credentials=service_credentials(role.service_credentials.get_secret_value()),
         http=httpx.Client(timeout=10.0),
-        audit=AuditLog(role.audit_path),
+        audit=audit_log(role.audit_path, role.audit_checkpoint_key, role.audit_checkpoint_path),
         service_base_url=role.service_base_url,
     )
     verifier = ClientAssertionVerifier(
@@ -97,7 +117,7 @@ def build_approver_service(role: ApproverSettings) -> ApproverService:
     return ApproverService(
         private_key=load_private_key(role.private_key.get_secret_value()),
         store=ApprovalStore(role.store_path),
-        audit=AuditLog(role.audit_path),
+        audit=audit_log(role.audit_path, role.audit_checkpoint_key, role.audit_checkpoint_path),
         discharge_ttl_seconds=role.discharge_ttl_seconds,
     )
 

@@ -148,6 +148,36 @@ def test_audit_logs_and_approvals_live_on_persistent_volumes(repo_root: Path) ->
         assert mounts
 
 
+def test_audit_checkpoints_are_keyed_per_role_and_stored_apart_from_the_logs(
+    repo_root: Path,
+) -> None:
+    services = _compose(repo_root)["services"]
+    generated = Keyset.generate().environment()
+    for role in ("authority", "broker", "approver"):
+        prefix = role.upper()
+        environment = services[role]["environment"]
+        assert environment[f"{prefix}_AUDIT_CHECKPOINT_KEY"].startswith(
+            f"${{{prefix}_AUDIT_CHECKPOINT_KEY:"
+        )
+        assert f"{prefix}_AUDIT_CHECKPOINT_KEY" in generated[role]
+        mounts = {
+            str(volume).split(":")[1]: str(volume).split(":")[0]
+            for volume in services[role]["volumes"]
+        }
+
+        def volume_of(path: str, mounts: dict[str, str] = mounts) -> str:
+            return next(
+                name for mount, name in mounts.items() if path.startswith(mount.rstrip("/") + "/")
+            )
+
+        checkpoint = volume_of(environment[f"{prefix}_AUDIT_CHECKPOINT_PATH"])
+        assert checkpoint != volume_of(environment[f"{prefix}_AUDIT_PATH"])
+    holders = {
+        role for role, variables in generated.items() if any("CHECKPOINT" in n for n in variables)
+    }
+    assert holders == {"authority", "broker", "approver"}
+
+
 def _revealed(settings: object) -> str:
     values = []
     for value in vars(settings).values():
