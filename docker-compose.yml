@@ -10,7 +10,14 @@
 #   docker compose exec approver capability-tool-broker approver review   # a human decides
 #   docker compose run --rm agent-host e2e resume
 #
-# The Redis image is pinned by tag; pin it by digest before publishing (see .github/workflows/ci.yml).
+# Networks: `frontend` joins the agent host to the authority, the approver and the broker.
+# `backend` is internal (no route out) and joins only the broker, Redis and the fake services, so
+# the agent host can reach neither Redis (counters, single-use nonces, revocations) nor the
+# services. Redis also requires a password that reaches only Redis itself and the broker's
+# BROKER_REDIS_URL; Redis reads it from a private tmpfs file, not from its command line.
+#
+# Audit logs and the approval queue live on named volumes, so they survive container restarts.
+# The Redis image is pinned by digest (redis:7.4-alpine, resolved 2026-09-13).
 
 x-hardening: &hardening
   read_only: true
@@ -34,10 +41,22 @@ x-app: &app
 services:
   redis:
     <<: *hardening
-    image: redis:7.4-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    # The image's unprivileged user: its entrypoint's chown and gosu steps need capabilities that
+    # are dropped above, and they are skipped for a non-root user.
+    user: redis
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        umask 077 && printf 'requirepass %s\n' "$$REDIS_PASSWORD" > /tmp/redis.conf &&
+        exec redis-server /tmp/redis.conf --save '' --appendonly no
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?run keygen first}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?run keygen first}
     tmpfs:
+      - /tmp:size=1m
       - /data:size=64m
+    networks: [backend]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -47,6 +66,7 @@ services:
   services:
     <<: *app
     command: ["serve", "services"]
+    networks: [backend]
     environment:
       APP_ENVIRONMENT: prod
       APP_HOST: 0.0.0.0
@@ -59,6 +79,7 @@ services:
   authority:
     <<: *app
     command: ["serve", "authority"]
+    networks: [frontend]
     ports:
       - "127.0.0.1:8001:8001"
     environment:
@@ -68,11 +89,14 @@ services:
       AUTHORITY_ROOT_KEYS: ${AUTHORITY_ROOT_KEYS:?run keygen first}
       AUTHORITY_APPROVER_PUBLIC_KEY: ${AUTHORITY_APPROVER_PUBLIC_KEY:?run keygen first}
       AUTHORITY_CLIENT_PUBLIC_KEYS: ${AUTHORITY_CLIENT_PUBLIC_KEYS:?run keygen first}
-      AUTHORITY_AUDIT_PATH: /tmp/authority-audit.jsonl
+      AUTHORITY_AUDIT_PATH: /var/lib/ctb/authority-audit.jsonl
+    volumes:
+      - authority-data:/var/lib/ctb
 
   approver:
     <<: *app
     command: ["serve", "approver"]
+    networks: [frontend]
     ports:
       - "127.0.0.1:8003:8003"
     environment:
@@ -81,12 +105,15 @@ services:
       APP_PORT: "8003"
       APPROVER_PRIVATE_KEY: ${APPROVER_PRIVATE_KEY:?run keygen first}
       APPROVER_CLIENT_PUBLIC_KEYS: ${APPROVER_CLIENT_PUBLIC_KEYS:?run keygen first}
-      APPROVER_STORE_PATH: /tmp/approvals.json
-      APPROVER_AUDIT_PATH: /tmp/approver-audit.jsonl
+      APPROVER_STORE_PATH: /var/lib/ctb/approvals.json
+      APPROVER_AUDIT_PATH: /var/lib/ctb/approver-audit.jsonl
+    volumes:
+      - approver-data:/var/lib/ctb
 
   broker:
     <<: *app
     command: ["serve", "broker"]
+    networks: [frontend, backend]
     ports:
       - "127.0.0.1:8002:8002"
     depends_on:
@@ -104,16 +131,18 @@ services:
       BROKER_CLIENT_PUBLIC_KEYS: ${BROKER_CLIENT_PUBLIC_KEYS:?run keygen first}
       BROKER_MANIFEST_PATH: /run/manifest/manifest.signed.json
       BROKER_SERVICE_BASE_URL: http://services:8090
-      BROKER_REDIS_URL: redis://redis:6379/0
-      BROKER_AUDIT_PATH: /tmp/broker-audit.jsonl
+      BROKER_REDIS_URL: redis://:${REDIS_PASSWORD:?run keygen first}@redis:6379/0
+      BROKER_AUDIT_PATH: /var/lib/ctb/broker-audit.jsonl
     volumes:
       - ./deploy/local/manifest.signed.json:/run/manifest/manifest.signed.json:ro
+      - broker-data:/var/lib/ctb
 
   agent-host:
     <<: *app
     profiles: ["e2e"]
     restart: "no"
     command: ["e2e", "start"]
+    networks: [frontend]
     depends_on:
       - authority
       - approver
@@ -129,5 +158,13 @@ services:
     volumes:
       - agent-state:/state
 
+networks:
+  frontend: {}
+  backend:
+    internal: true
+
 volumes:
   agent-state:
+  authority-data:
+  approver-data:
+  broker-data:

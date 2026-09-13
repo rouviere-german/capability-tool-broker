@@ -10,6 +10,7 @@ from __future__ import annotations
 import types
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -76,6 +77,77 @@ def test_compose_hands_each_secret_only_to_its_role(repo_root: Path) -> None:
     )
 
 
+def _compose(repo_root: Path) -> dict[str, Any]:
+    loaded = yaml.safe_load((repo_root / "docker-compose.yml").read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict)
+    return loaded
+
+
+def _networks(service: dict[str, Any]) -> set[str]:
+    declared = service.get("networks")
+    return {"default"} if declared is None else set(declared)
+
+
+def test_the_agent_host_cannot_reach_redis_or_the_services(repo_root: Path) -> None:
+    # A compromised agent host that could reach Redis could delete counters, nonces and the
+    # revocation denylist; one that could reach the services could at least probe them.
+    compose = _compose(repo_root)
+    services = compose["services"]
+    networks = {name: _networks(service) for name, service in services.items()}
+    for backend in ("redis", "services"):
+        for role in ("agent-host", "authority", "approver"):
+            assert not networks[role] & networks[backend], (role, backend)
+        assert networks["broker"] & networks[backend]
+        for network in networks[backend]:
+            assert compose["networks"][network].get("internal") is True, network
+    assert networks["broker"] & networks["agent-host"]
+
+
+def test_redis_requires_a_password_that_only_redis_and_the_broker_receive(
+    repo_root: Path,
+) -> None:
+    services = _compose(repo_root)["services"]
+    holders = {
+        name
+        for name, service in services.items()
+        if "REDIS_PASSWORD" in yaml.safe_dump(service.get("environment") or {})
+    }
+    assert holders == {"redis", "broker"}
+    broker_url = services["broker"]["environment"]["BROKER_REDIS_URL"]
+    assert broker_url.startswith("redis://:${REDIS_PASSWORD")
+    redis_service = services["redis"]
+    command = " ".join(redis_service["command"])
+    assert "requirepass" in command
+    # Only a reference to the variable, expanded by the shell inside the container.
+    assert "REDIS_PASSWORD" not in command.replace('"$$REDIS_PASSWORD"', "")
+    assert "@sha256:" in redis_service["image"]
+    environment = Keyset.generate().environment()
+    assert set(environment["redis"]) == {"REDIS_PASSWORD"}
+    assert len(environment["redis"]["REDIS_PASSWORD"]) >= 32
+
+
+def test_audit_logs_and_approvals_live_on_persistent_volumes(repo_root: Path) -> None:
+    services = _compose(repo_root)["services"]
+    for role, variables in {
+        "authority": ("AUTHORITY_AUDIT_PATH",),
+        "broker": ("BROKER_AUDIT_PATH",),
+        "approver": ("APPROVER_AUDIT_PATH", "APPROVER_STORE_PATH"),
+    }.items():
+        mounts = [str(volume).split(":")[1] for volume in services[role].get("volumes", [])]
+        named = [
+            str(volume).split(":")[1]
+            for volume in services[role].get("volumes", [])
+            if not str(volume).startswith((".", "/"))
+        ]
+        tmpfs = [str(entry).split(":")[0] for entry in services[role].get("tmpfs", [])]
+        assert tmpfs  # the hardening anchor still applies
+        for variable in variables:
+            path = services[role]["environment"][variable]
+            assert not any(path.startswith(mount.rstrip("/") + "/") for mount in tmpfs), path
+            assert any(path.startswith(mount.rstrip("/") + "/") for mount in named), (role, path)
+        assert mounts
+
+
 def _revealed(settings: object) -> str:
     values = []
     for value in vars(settings).values():
@@ -96,6 +168,7 @@ def test_role_settings_cannot_load_other_roles_secrets(monkeypatch: pytest.Monke
         "services": environment["broker"]["BROKER_SERVICE_CREDENTIALS"],
         "approver": environment["approver"]["APPROVER_PRIVATE_KEY"],
         "manifest-signing": environment["manifest-signing"]["MANIFEST_SIGNING_KEY"],
+        "redis": environment["redis"]["REDIS_PASSWORD"],
     }
     agent = _revealed(AgentHostSettings(_env_file=None))
     approver = _revealed(ApproverSettings(_env_file=None))
@@ -104,11 +177,11 @@ def test_role_settings_cannot_load_other_roles_secrets(monkeypatch: pytest.Monke
     broker = _revealed(BrokerSettings(_env_file=None))
     for secret in secrets_by_role.values():
         assert secret not in agent
-    for name in ("root", "services", "manifest-signing"):
+    for name in ("root", "services", "manifest-signing", "redis"):
         assert secrets_by_role[name] not in approver
-    for name in ("services", "approver", "manifest-signing"):
+    for name in ("services", "approver", "manifest-signing", "redis"):
         assert secrets_by_role[name] not in authority
-    for name in ("root", "approver", "manifest-signing"):
+    for name in ("root", "approver", "manifest-signing", "redis"):
         assert secrets_by_role[name] not in services
     assert secrets_by_role["approver"] not in broker
     assert secrets_by_role["services"] in broker
@@ -157,6 +230,7 @@ def _secret_fragments(stack: Stack) -> list[bytes]:
         del kid
     approver_raw = stack.keys.approver_private.private_bytes_raw()
     fragments += [approver_raw, b64u_encode(approver_raw).encode()]
+    fragments.append(stack.keys.redis_password.encode())
     return fragments
 
 

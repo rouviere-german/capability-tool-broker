@@ -9,6 +9,7 @@ these (see ``tests/integration/test_no_ambient_authority.py``).
 
 from __future__ import annotations
 
+import secrets
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -79,6 +80,8 @@ class Keyset:
     manifest_private: Ed25519PrivateKey
     client_keys: dict[str, Ed25519PrivateKey]
     service_secrets: dict[str, bytes]
+    # Compose only: Redis requires it, and only the broker's BROKER_REDIS_URL carries it.
+    redis_password: str = field(default_factory=lambda: secrets.token_urlsafe(32))
 
     def __repr__(self) -> str:
         return f"Keyset(kids={self.ring.kids}, clients={sorted(self.client_keys)})"
@@ -128,6 +131,7 @@ class Keyset:
                 "APPROVER_CLIENT_PUBLIC_KEYS": client_public,
             },
             "services": {"SERVICES_CREDENTIALS": services},
+            "redis": {"REDIS_PASSWORD": self.redis_password},
             "agent-host": {
                 "AGENT_CLIENT_ID": agent_client,
                 "AGENT_CLIENT_PRIVATE_KEY": ed25519_private_text(agent_key),

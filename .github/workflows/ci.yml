@@ -3,8 +3,8 @@
 # Action pinning: actions are pinned to release tags and kept current by Dependabot
 # (.github/dependabot.yml, github-actions ecosystem). Before the repository is published, replace
 # each tag with the full commit SHA it points to and keep the tag as a trailing comment (for
-# example with `pinact run`): a tag can be moved, a SHA cannot. Pin the Redis image in
-# docker-compose.yml by digest at the same time. Base images in the Dockerfile are digest-pinned.
+# example with `pinact run`): a tag can be moved, a SHA cannot. Base images in the Dockerfile and
+# the Redis image in docker-compose.yml are digest-pinned.
 name: ci
 
 on:
