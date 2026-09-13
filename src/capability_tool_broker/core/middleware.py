@@ -12,7 +12,7 @@ import json
 import re
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import structlog
@@ -163,11 +163,14 @@ class RequestContextMiddleware:
 
 
 class RateLimitMiddleware:
-    """Token-bucket limit per authenticated key, or per client address when unauthenticated.
+    """Token-bucket limit per authenticated principal, or per client address otherwise.
 
-    The key is verified here (a hash plus constant-time compares) so random invalid keys cannot be
-    used to mint fresh buckets; invalid keys share the caller's address bucket. IPv6 addresses are
-    grouped by /64 (see :func:`client_bucket`).
+    Principals are an API key or, when the app passes ``subject_of``, the subject of a client
+    assertion whose signature and claims verify (without consuming its one-time ``jti``, which the
+    endpoint's own authentication does). Both are verified here, so random invalid keys or
+    assertions cannot mint fresh buckets: they share the caller's address bucket. Clients behind
+    one address each get their own bucket. IPv6 addresses are grouped by /64
+    (see :func:`client_bucket`).
     """
 
     def __init__(
@@ -177,21 +180,29 @@ class RateLimitMiddleware:
         limiter: RateLimiter,
         verifier: ApiKeyVerifier,
         metrics: HttpMetrics,
+        subject_of: Callable[[Headers], str | None] | None = None,
         exempt_paths: frozenset[str] = frozenset({"/healthz", "/readyz"}),
     ) -> None:
         self.app = app
         self.limiter = limiter
         self.verifier = verifier
         self.metrics = metrics
+        self.subject_of = subject_of
         self.exempt_paths = exempt_paths
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or scope.get("path") in self.exempt_paths:
             await self.app(scope, receive, send)
             return
-        principal = self.verifier.verify(extract_api_key(Headers(scope=scope)))
+        headers = Headers(scope=scope)
+        principal = self.verifier.verify(extract_api_key(headers))
+        subject = (
+            self.subject_of(headers) if principal is None and self.subject_of is not None else None
+        )
         if principal is not None:
             key = f"key:{principal.key_id}"
+        elif subject is not None:
+            key = "client:" + hashlib.sha256(subject.encode("utf-8")).hexdigest()[:32]
         else:
             client = scope.get("client")
             host = client[0] if client else "unknown"

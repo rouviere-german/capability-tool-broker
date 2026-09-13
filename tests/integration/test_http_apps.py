@@ -240,6 +240,39 @@ def test_approvals_over_http_are_visible_only_to_their_requester(apps: Apps, sta
     )
 
 
+def test_rate_limits_apply_per_authenticated_client_not_per_address(stack: Stack) -> None:
+    verifier = ClientAssertionVerifier(
+        {
+            CLIENT: stack.keys.client_keys[CLIENT].public_key(),
+            "other-client": OTHER_KEY.public_key(),
+        },
+        audience="broker",
+        clock=stack.clock,
+    )
+    limited = Settings(
+        _env_file=None, environment="test", rate_limit_per_second=0.001, rate_limit_burst=2
+    )
+    app = create_broker_app(
+        stack.broker, verifier, ManifestHolder.from_manifest(stack.manifest), settings=limited
+    )
+    agent = ClientCredentials(CLIENT, stack.keys.client_keys[CLIENT], clock=stack.clock)
+    other = ClientCredentials("other-client", OTHER_KEY, clock=stack.clock)
+    with TestClient(app) as client:  # every request arrives from the same address
+        codes = [
+            client.get("/v1/manifest", headers=agent.authorization("broker")).status_code
+            for _ in range(3)
+        ]
+        assert codes == [200, 200, 429]
+        assert client.get("/v1/manifest", headers=other.authorization("broker")).status_code == 200
+        garbage = {"Authorization": "Bearer not-a-client-assertion"}
+        assert [client.get("/v1/manifest", headers=garbage).status_code for _ in range(3)] == [
+            401,
+            401,
+            429,
+        ]  # unverifiable assertions share the address bucket and cannot mint fresh ones
+        assert client.get("/v1/manifest", headers=other.authorization("broker")).status_code == 200
+
+
 def test_services_app_accepts_only_signed_requests(apps: Apps, stack: Stack) -> None:
     assert apps.services.get("/invoices.internal/invoices/42").status_code == 401
     headers = sign_request(

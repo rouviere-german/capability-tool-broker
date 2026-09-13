@@ -15,10 +15,12 @@ import secrets
 import threading
 import time
 from collections.abc import Callable, Mapping
+from typing import NamedTuple
 
 import jwt
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from fastapi import Request
+from starlette.datastructures import Headers
 
 from capability_tool_broker.core.errors import AppError
 from capability_tool_broker.core.logging import get_logger
@@ -28,6 +30,7 @@ __all__ = [
     "ClientAssertionVerifier",
     "ClientAuthError",
     "bearer_client_dependency",
+    "bearer_subject",
     "make_client_assertion",
 ]
 
@@ -42,6 +45,13 @@ _REQUIRED = ("iss", "sub", "aud", "iat", "exp", "jti")
 
 class ClientAuthError(Exception):
     """Authentication failed. The message is safe to log; clients only ever see a 401."""
+
+
+class _Checked(NamedTuple):
+    issuer: str
+    jti: str
+    expires: int
+    now: float
 
 
 def make_client_assertion(
@@ -86,8 +96,34 @@ class ClientAssertionVerifier:
     def audience(self) -> str:
         return self._audience
 
-    def verify(self, assertion: str) -> str:  # noqa: PLR0912 - one check per claim rule
+    def verify(self, assertion: str) -> str:
         """Return the authenticated client id or raise ClientAuthError."""
+        checked = self._check(assertion)
+        with self._lock:
+            if len(self._seen) >= self._max_jtis:
+                self._seen = {k: v for k, v in self._seen.items() if v > checked.now}
+                if len(self._seen) >= self._max_jtis:
+                    raise ClientAuthError("replay cache full")
+            replay_key = f"{checked.issuer}:{checked.jti}"
+            if replay_key in self._seen and self._seen[replay_key] > checked.now:
+                raise ClientAuthError("assertion replayed")
+            self._seen[replay_key] = checked.expires + self._leeway
+        return checked.issuer
+
+    def peek_subject(self, assertion: str) -> str | None:
+        """The client id of a correctly signed, unexpired assertion for this audience, else None.
+
+        The one-time ``jti`` is not consumed (the endpoint's authentication does that), which suits
+        rate-limit keying: only someone holding a valid assertion for a client can charge that
+        client's bucket, and forged assertions fall back to the caller's address bucket.
+        """
+        try:
+            return self._check(assertion).issuer
+        except ClientAuthError:
+            return None
+
+    def _check(self, assertion: str) -> _Checked:
+        """Every check except the one-time ``jti``."""
         if not assertion or len(assertion) > _MAX_ASSERTION_CHARS:
             raise ClientAuthError("missing or oversized assertion")
         try:
@@ -134,24 +170,29 @@ class ClientAssertionVerifier:
         jti = claims.get("jti")
         if not isinstance(jti, str) or not _JTI.fullmatch(jti):
             raise ClientAuthError("invalid jti")
-        with self._lock:
-            if len(self._seen) >= self._max_jtis:
-                self._seen = {k: v for k, v in self._seen.items() if v > now}
-                if len(self._seen) >= self._max_jtis:
-                    raise ClientAuthError("replay cache full")
-            replay_key = f"{issuer}:{jti}"
-            if replay_key in self._seen and self._seen[replay_key] > now:
-                raise ClientAuthError("assertion replayed")
-            self._seen[replay_key] = expires + self._leeway
-        return issuer
+        return _Checked(issuer, jti, expires, now)
+
+
+def _bearer(headers: Headers) -> str:
+    header = headers.get("authorization", "")
+    return header[7:].strip() if header[:7].lower() == "bearer " else ""
+
+
+def bearer_subject(verifier: ClientAssertionVerifier) -> Callable[[Headers], str | None]:
+    """Rate-limit principal: the verified client id of the request's bearer assertion, if any."""
+
+    def subject(headers: Headers) -> str | None:
+        assertion = _bearer(headers)
+        return verifier.peek_subject(assertion) if assertion else None
+
+    return subject
 
 
 def bearer_client_dependency(verifier: ClientAssertionVerifier) -> Callable[[Request], str]:
     """FastAPI dependency: authenticate ``Authorization: Bearer <client assertion>``."""
 
     def dependency(request: Request) -> str:
-        header = request.headers.get("authorization", "")
-        assertion = header[7:].strip() if header[:7].lower() == "bearer " else ""
+        assertion = _bearer(request.headers)
         try:
             return verifier.verify(assertion)
         except ClientAuthError as exc:

@@ -22,6 +22,7 @@ from capability_tool_broker.approver.service import (
 from capability_tool_broker.authority.clientauth import (
     ClientAssertionVerifier,
     bearer_client_dependency,
+    bearer_subject,
 )
 from capability_tool_broker.core.app import create_app
 from capability_tool_broker.core.config import Settings
@@ -38,7 +39,10 @@ def create_approver_app(
     tracer_provider: TracerProvider | None = None,
 ) -> FastAPI:
     app = create_app(
-        settings, readiness_checks={"approver_key": lambda: True}, tracer_provider=tracer_provider
+        settings,
+        readiness_checks={"approver_key": lambda: True},
+        tracer_provider=tracer_provider,
+        rate_limit_subject=bearer_subject(verifier),
     )
     client = bearer_client_dependency(verifier)
 

@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from opentelemetry.sdk.trace import TracerProvider
 from prometheus_client import CollectorRegistry
+from starlette.datastructures import Headers
 
 from capability_tool_broker import __version__
 from capability_tool_broker.core.config import Settings, get_settings
@@ -49,10 +50,13 @@ def create_app(
     readiness_checks: Mapping[str, ReadinessCheck] | None = None,
     registry: CollectorRegistry | None = None,
     tracer_provider: TracerProvider | None = None,
+    rate_limit_subject: Callable[[Headers], str | None] | None = None,
 ) -> FastAPI:
     """Build the app. All state hangs off ``app.state``; nothing global is mutated.
 
     Callers add their routes to the returned app; the middleware stack wraps them as well.
+    ``rate_limit_subject`` maps request headers to a verified principal (for example a client
+    assertion's subject) so each principal gets its own rate-limit bucket.
     """
     cfg = settings if settings is not None else get_settings()
     checks: dict[str, ReadinessCheck] = dict(readiness_checks or {})
@@ -102,7 +106,13 @@ def create_app(
 
     # add_middleware prepends, so the last one added is the outermost.
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=cfg.max_body_bytes, metrics=metrics)
-    app.add_middleware(RateLimitMiddleware, limiter=limiter, verifier=verifier, metrics=metrics)
+    app.add_middleware(
+        RateLimitMiddleware,
+        limiter=limiter,
+        verifier=verifier,
+        metrics=metrics,
+        subject_of=rate_limit_subject,
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(cfg.cors_allow_origins),

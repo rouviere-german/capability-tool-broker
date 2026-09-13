@@ -11,6 +11,7 @@ from prometheus_client import CollectorRegistry
 from capability_tool_broker.authority.clientauth import (
     ClientAssertionVerifier,
     bearer_client_dependency,
+    bearer_subject,
 )
 from capability_tool_broker.authority.service import (
     Authority,
@@ -39,6 +40,7 @@ def create_authority_app(
         readiness_checks=readiness_checks or {"root_key": lambda: True},
         registry=registry,
         tracer_provider=tracer_provider,
+        rate_limit_subject=bearer_subject(verifier),
     )
     client = bearer_client_dependency(verifier)
 

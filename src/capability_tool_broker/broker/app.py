@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from capability_tool_broker.authority.clientauth import (
     ClientAssertionVerifier,
     bearer_client_dependency,
+    bearer_subject,
 )
 from capability_tool_broker.broker.broker import Broker, ToolCall
 from capability_tool_broker.broker.manifest import ManifestHolder
@@ -60,6 +61,7 @@ def create_broker_app(
         },
         registry=broker.metrics.registry,
         tracer_provider=tracer_provider,
+        rate_limit_subject=bearer_subject(verifier),
     )
     client = bearer_client_dependency(verifier)
 
