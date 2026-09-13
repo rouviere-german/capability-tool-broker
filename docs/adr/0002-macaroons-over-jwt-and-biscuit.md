@@ -29,7 +29,8 @@ Options considered:
 
 ## Decision
 
-Use macaroons, implemented in-repo (`src/capability_tool_broker/macaroons/`, about 300 lines),
+Use macaroons, implemented in-repo (`src/capability_tool_broker/macaroons/`, 463 lines including
+docstrings: `macaroon.py` 260, `crypto.py` 96, `codec.py` 67),
 byte-compatible with libmacaroons for signatures and the V2 binary format and checked against
 the published libmacaroons README vectors and pymacaroons as a differential oracle. The caveat
 language is a small canonical DSL (no eval) evaluated by the broker. Root keys are per token,
@@ -44,13 +45,15 @@ Two deliberate deviations from libmacaroons:
 
 ## Consequences
 
-- Attenuation is offline and monotone, which the soundness benchmark checks against an exhaustive
-  reference evaluator (2,000 chains, 900 requests each).
+- Attenuation is offline and monotone, which the soundness benchmark checks against an independent
+  reference evaluator, exhaustively over a 900-request universe for 2,000 random chains (a finite
+  sample of chains, not a proof).
 - Verification needs the root key, so the broker and the authority share the key ring. There is
   no public verifiability; a compromised broker could mint tokens. That is acceptable because the
   broker already holds the service credentials, which are worth more.
 - Stateless caveats cannot express "at most N calls". `max_calls` and `once` need online state
-  (Redis), committed atomically after every stateless check (see ADR 0004).
+  (Redis), committed atomically after every stateless check (see ADR 0004). That state is part
+  of the trusted computing base: Redis must be unreachable from agent hosts.
 - Revocation is short expiry plus a nonce denylist keyed by the root identifier; there is no
   distributed revocation list.
 - Tokens are bearer credentials. The `client` caveat and client-credential JWT authentication at

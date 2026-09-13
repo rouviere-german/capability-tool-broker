@@ -3,7 +3,8 @@
 Attenuation is monotone by construction. Caveats are conjunctive and cannot be removed without
 breaking the HMAC chain, so a child token authorizes a subset of what its parent authorizes; a
 child that "asks" for a wider glob or an extra tool still carries the parent's caveats. The
-property tests check this against an exhaustive oracle.
+soundness tests compare it with an independent reference evaluator, exhaustively over a finite
+900-request universe for randomly generated chains.
 """
 
 from __future__ import annotations

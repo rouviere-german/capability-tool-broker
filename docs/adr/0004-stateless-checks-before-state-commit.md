@@ -24,12 +24,19 @@ The broker runs, in order:
 3. evaluation of every first-party caveat, then undischarged third-party caveats (so no human is
    asked to approve a call the token forbids anyway);
 4. required caveat types from the manifest and approval evidence for write and delete;
-5. revocation check, then one atomic commit of every `max_calls` counter and `once` nonce;
-6. credential injection, the upstream call, output capping and wrapping.
+5. a write-ahead `broker.authorize` audit record; if it cannot be written the call is denied;
+6. revocation check, then one atomic commit of every `max_calls` counter and `once` nonce;
+7. credential injection, the upstream call, output capping and wrapping, then the outcome record.
 
 Counter keys are `sha256(label || chain signature right after the caveat)`. Every copy of a token
-prefix computes the same key; a caveat appended later has a different prefix signature. The Redis
-store commits with WATCH/MULTI/EXEC and bounded retries; the in-memory store under a lock.
+prefix computes the same key; a caveat appended later has a different prefix signature. A key's
+lifetime is the earliest `expires` among the caveats before it in the same chain (plus five
+minutes of grace), because that prefix is what every holder of the key shares, and a commit never
+shortens an existing key's lifetime. An earlier version took the lifetime from every expiry in the
+presented token: a holder could append a one-second expiry after `max_calls` or after a
+discharge's `once`, and the store forgot the counter or nonce while the parent token or the
+original discharge was still valid. The Redis store commits with WATCH/MULTI/EXEC and bounded
+retries; the in-memory store under a lock.
 
 ## Consequences
 
@@ -37,7 +44,10 @@ store commits with WATCH/MULTI/EXEC and bounded retries; the in-memory store und
   `tests/integration/test_broker_pipeline.py`).
 - The manifest is part of the trusted computing base: a wrong verb in the manifest would bypass
   approvals, which is why the manifest is signed and `/readyz` fails without a valid signature.
-- A call that fails upstream after the commit has consumed its slot; the outcome is audited as an
-  upstream error.
+- A call whose service connection could not be established (or whose service has no configured
+  credential) sent nothing, so its counters and nonces are released and the approval can be used
+  again. Any other upstream failure may have reached the service, so its slot and approval stay
+  consumed (fail closed); the outcome is audited as an upstream error in both cases.
+- No effect runs without a prior audit record, at the price of a second audit append per call.
 - WATCH/MULTI avoids a Lua dependency and runs on fakeredis in tests; under heavy contention the
   broker reports `state_unavailable` after the retry budget instead of admitting the call.

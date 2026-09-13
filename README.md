@@ -78,13 +78,15 @@ and argument predicates such as `arg amount <= 500`. Unknown or non-canonical ca
 **Delegation.** `delegate(tools, resources, verbs, max_calls, ttl)` appends caveats to the parent's
 token. Because caveats are conjunctive, a child that asks for `invoice/*` while its parent holds
 `invoice/42` still gets only `invoice/42`. `max_calls` counters are keyed by the chain signature
-right after the caveat, so every copy of a token prefix shares one counter.
+right after the caveat, so every copy of a token prefix shares one counter, and a counter lives as
+long as that prefix's own expiry, so a short-lived child cannot make the broker forget it.
 
 **Approvals.** Templates that grant write or delete get a third-party caveat scoped to
 `verb in write,delete` (reads need no approval), sealed to the approver and tagged by the authority.
 After a human approves the canonical request (tool, verb and host from the manifest, resource,
 arguments, task), the approver mints a discharge carrying `request_hash`, `task_id`, a two-minute
-`expires` and a `once` nonce; the agent binds it to its token. See
+`expires` and a `once` nonce; the agent binds it to its token. The approver accepts approval
+requests only from the client the token was minted for. See
 [ADR 0003](docs/adr/0003-approvals-as-authority-tagged-scoped-discharges.md).
 
 ## Quickstart
@@ -108,7 +110,8 @@ denied with the failing caveat (`resource matches invoice/42`, `tool in invoices
 `tool in invoices_read,invoices_update_status`); the planner's status change waiting on CLI
 approval with the full canonical request shown to the reviewer; the approved call executing once;
 a replay of the discharge denied (`replayed`) and its reuse for different arguments denied by the
-discharge's `request_hash` caveat; and the verified audit chain.
+discharge's `request_hash` caveat; and the audit chain verified against its signed checkpoint, with
+an edited copy and a truncated copy both detected.
 
 Compose stack (built locally, fake services and Redis; CI runs this in the `compose-integration`
 job):
@@ -218,22 +221,34 @@ replay):
 - **No ambient authority.** Service credentials exist only in the broker's environment (and the
   fake services' own copy); the compose file, the per-role settings classes and the live object
   graph of the agent host and approver are checked for leaks.
+- **Isolated broker state.** In compose, Redis and the fake services sit on an internal network
+  that only the broker joins, and Redis requires a password that only Redis and the broker's
+  `BROKER_REDIS_URL` receive, so an agent host cannot reset counters, nonces or revocations.
 - **Unforgeable, attenuation-only tokens.** HMAC-SHA256 chains compared in constant time, strict
   canonical decoding, key ids with a dual-key rotation window
-  ([runbook](docs/RUNBOOK_KEY_ROTATION.md)), soundness checked against an exhaustive oracle.
+  ([runbook](docs/RUNBOOK_KEY_ROTATION.md)); authorized sets compared with an independent
+  reference evaluator over a 900-request universe for 2,000 random chains.
 - **Approvals bound to the request.** Discharges carry the canonical request hash and a single-use
   nonce, are bound to the token family, and count as evidence only for authority-tagged caveats;
-  the approver key is separate from the root key.
+  the approver key is separate from the root key, and the approver accepts requests only from the
+  token's own client.
 - **Signed tool manifests.** Verb, host, route mapping, credential and required caveat types come
   from an Ed25519-signed manifest; an unsigned or modified manifest fails readiness and every call.
 - **Broker-only access to services.** Services accept only HMAC-signed requests with fresh nonces.
-- **Budgets.** Per-token `max_calls` (atomic, shared by delegated copies) plus per-task step, token
-  and USD budgets shared by sub-agents.
+- **Call limits.** Per-token `max_calls` enforced by the broker: atomic, shared by delegated
+  copies, living as long as the shared chain prefix (a short-lived child cannot reset it), and not
+  consumed by denied calls or by calls that never reached a service. A sequential reference model
+  checks these semantics on random call sequences. Per-task step, LLM token and USD budgets are
+  enforced by the agent host for its sub-agents: they bound cost and runaway loops but are not an
+  authorization boundary (see Non-goals).
 - **Prompt-injection suite.** Scripted models that obey every injected instruction cannot exceed
   their token's authority; tool output is capped and wrapped as untrusted data.
 - **Audit, authn, limits.** Hash-chained audit of mint, attenuate, deny (with the failing caveat),
-  discharge and execute; EdDSA client-credential JWTs per service audience; token-bucket rate
-  limits; body, token and output size limits; PII redaction in logs and audit records.
+  discharge, authorize and execute. The broker writes its `broker.authorize` record before any
+  state commit or effect and denies the call if it cannot; each role signs a checkpoint of its log
+  after every append and refuses to reopen a log that was truncated, rolled back or rebuilt. EdDSA
+  client-credential JWTs per service audience; token-bucket rate limits per authenticated client;
+  body, token and output size limits; PII redaction in logs and audit records.
 - **Operations.** `/readyz` checks root key, Redis and manifest signature; metrics
   `capability_decisions_total{result,caveat_type}`, `verify_latency_seconds`,
   `broker_call_latency_seconds`; the broker span joins the agent step's trace via `traceparent`.
@@ -245,9 +260,21 @@ Reporting vulnerabilities: [SECURITY.md](SECURITY.md).
 
 ## Non-goals
 
-- **Process isolation of tool code.** The broker calls remote services; it does not sandbox code
-  running on the agent host. A compromise of the agent host process gets its tokens (narrow,
-  short-lived) but nothing else; sandboxing is the subject of a separate project.
+- **Process isolation of tool code, and a compromised agent host.** The broker calls remote
+  services; it does not sandbox code running on the agent host. A compromise of the agent host
+  process gets its tokens and its client private key. The client key is minting authority within
+  the policy: the attacker can request any template the policy grants that client, with parameters
+  of its choosing, so with the default policy it can read any invoice (`invoice-audit`) and ask
+  for approvals on any invoice id. Writes and deletes still need a human approval of the exact
+  request. Binding mints to task grants the host cannot forge is not implemented; sandboxing is
+  the subject of a separate project.
+- **Budgets as an authorization boundary.** Step, LLM token and USD budgets run in the agent host,
+  and a compromised host ignores them; the broker enforces per-token `max_calls`, expiry and rate
+  limits only.
+- **Audit integrity against a compromised writer.** Signed checkpoints detect a truncated,
+  rolled-back or rebuilt log by anyone who cannot also rewrite the checkpoint with its key.
+  Restoring an older log together with its older checkpoint is not detected, and compose keeps
+  checkpoints on a second volume of the same container rather than on a separate host.
 - **Public verifiability.** Macaroons are verified with the shared root key; there is no
   public-key token format and no third-party verifier.
 - **Distributed revocation and multi-replica state.** Revocation is short expiry plus a denylist
@@ -280,6 +307,15 @@ Deviations from the original specification, recorded honestly:
   universe.
 - The three fake services run in one `services` container instead of three.
 - Traces are exported to the console or not at all; there is no OTLP exporter dependency.
+- The control "per-task step, token and USD budgets" is implemented in the agent host, not at the
+  broker, and is documented as a cost control rather than an authorization boundary.
+- The escalation suite has 42 scenarios: the specified families plus two that combine delegation
+  or discharge attenuation with clock jumps past the state store's grace period.
+- A call whose upstream connection was never established releases its counters and approval
+  ([ADR 0004](docs/adr/0004-stateless-checks-before-state-commit.md)).
+- Added beyond the specification: a write-ahead audit record before every effect, HMAC-signed
+  audit checkpoints, per-client rate-limit buckets, and a sequential model check of stateful
+  semantics in the bench.
 
 ## Project layout
 
