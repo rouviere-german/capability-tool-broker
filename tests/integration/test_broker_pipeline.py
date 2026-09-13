@@ -7,6 +7,7 @@ import secrets
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
+import fakeredis
 import httpx
 import pytest
 from opentelemetry.sdk.trace import TracerProvider
@@ -24,12 +25,15 @@ from capability_tool_broker.agentic.providers.fake import FakeProvider, Scripted
 from capability_tool_broker.broker.broker import Broker, ToolCall
 from capability_tool_broker.broker.manifest import ManifestHolder
 from capability_tool_broker.broker.state import (
+    EXPIRY_GRACE_SECONDS,
     CommitResult,
     MemoryStateStore,
+    RedisStateStore,
     StateUnavailableError,
 )
 from capability_tool_broker.capabilities.attenuate import attenuate
 from capability_tool_broker.capabilities.caveats import (
+    ExpiresBefore,
     Once,
     Predicate,
     RequestHashIs,
@@ -44,7 +48,7 @@ from capability_tool_broker.capabilities.verifier import StateClaim
 from capability_tool_broker.macaroons.codec import b64u_encode
 from capability_tool_broker.macaroons.macaroon import Macaroon
 from capability_tool_broker.stack import Stack
-from support import CLIENT, advance, approve, bind, call, make_stack, mint, raw_token
+from support import CLIENT, T0, advance, approve, bind, call, make_stack, mint, raw_token
 
 pytestmark = pytest.mark.integration
 
@@ -238,6 +242,64 @@ def test_call_counters_are_shared_by_attenuated_copies_and_not_burned_by_denials
     assert call(stack, token, "invoices_read", "invoice/42").reason == "exhausted"
 
 
+def test_a_short_lived_child_cannot_reset_the_shared_call_counter(stack: Stack) -> None:
+    token = mint(stack).token  # invoice-review: max_calls <= 20, expires in 600 s
+    child = attenuate(Macaroon.deserialize(token), [ExpiresBefore(T0 + 1)]).serialize()
+    results = [call(stack, child, "invoices_read", "invoice/42").allowed for _ in range(21)]
+    assert results == [True] * 20 + [False]
+    assert call(stack, token, "invoices_read", "invoice/42").reason == "exhausted"
+    advance(stack, EXPIRY_GRACE_SECONDS + 2)  # the child expired long ago; the parent is valid
+    assert call(stack, token, "invoices_read", "invoice/42").reason == "exhausted"
+    assert len(stack.invoices.effects) == 20
+
+
+def test_a_short_lived_child_does_not_shorten_redis_counter_lifetimes(tmp_path: Path) -> None:
+    client = fakeredis.FakeRedis()
+    stack = make_stack(tmp_path, state=RedisStateStore(client, prefix="t:"))
+    try:
+        minted = mint(stack)
+        assert call(stack, minted.token, "invoices_read", "invoice/42").allowed
+        (key,) = [k.decode() if isinstance(k, bytes) else k for k in client.keys("t:calls:*")]
+        expected = minted.expires_at + EXPIRY_GRACE_SECONDS
+        assert client.expiretime(key) == expected
+        child = attenuate(Macaroon.deserialize(minted.token), [ExpiresBefore(T0 + 1)])
+        assert call(stack, child.serialize(), "invoices_read", "invoice/42").allowed
+        assert client.expiretime(key) == expected
+    finally:
+        stack.close()
+
+
+def test_an_attenuated_discharge_cannot_outlive_its_single_use_nonce(tmp_path: Path) -> None:
+    stack = make_stack(tmp_path, discharge_ttl_seconds=900)
+    try:
+        token = mint(stack).token
+        denied = call(stack, token, "invoices_update_status", "invoice/42", STATUS)
+        discharge = approve(stack, denied)
+        shortened = attenuate(Macaroon.deserialize(discharge), [ExpiresBefore(T0 + 1)])
+        first = call(
+            stack,
+            token,
+            "invoices_update_status",
+            "invoice/42",
+            STATUS,
+            discharges=[bind(token, shortened.serialize())],
+        )
+        assert first.allowed
+        advance(stack, EXPIRY_GRACE_SECONDS + 2)  # the original discharge is still unexpired
+        replay = call(
+            stack,
+            token,
+            "invoices_update_status",
+            "invoice/42",
+            STATUS,
+            discharges=[bind(token, discharge)],
+        )
+        assert replay.reason == "replayed"
+        assert [e.kind for e in stack.invoices.effects] == ["write"]
+    finally:
+        stack.close()
+
+
 def test_expired_and_revoked_tokens_are_denied(stack: Stack) -> None:
     short = mint(stack, ttl_seconds=60).token
     assert call(stack, short, "invoices_read", "invoice/42").allowed
@@ -266,9 +328,7 @@ class _BrokenState(MemoryStateStore):
         super().__init__()
         self.failure = failure
 
-    def commit(
-        self, claims: Sequence[StateClaim], *, expires_at: int | None, now: int
-    ) -> CommitResult:
+    def commit(self, claims: Sequence[StateClaim], *, now: int) -> CommitResult:
         if self.failure == "down":
             raise StateUnavailableError("down")
         return CommitResult(False, "contention")

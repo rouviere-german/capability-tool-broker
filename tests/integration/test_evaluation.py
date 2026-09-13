@@ -29,6 +29,7 @@ from capability_tool_broker.evaluation.soundness import (
     run_soundness,
     universe,
 )
+from capability_tool_broker.evaluation.stateful import run_stateful
 
 pytestmark = pytest.mark.integration
 
@@ -79,9 +80,9 @@ def test_forgery_suite_accepts_nothing(tmp_path: Path) -> None:
 
 
 def test_scenario_catalog() -> None:
-    assert len(SCENARIOS) == 40
+    assert len(SCENARIOS) == 42
     assert len(BENIGN_TASKS) == 30
-    assert len({s.name for s in (*SCENARIOS, *BENIGN_TASKS)}) == 70
+    assert len({s.name for s in (*SCENARIOS, *BENIGN_TASKS)}) == 72
     assert len({s.family for s in SCENARIOS}) == 11
 
 
@@ -89,9 +90,31 @@ def test_escalation_suite_broker_versus_ambient_keys(tmp_path: Path) -> None:
     report = run_escalation(tmp_path)
     assert report.failures == []
     assert report.capability_unauthorized_effects == 0
-    assert report.ambient_scenarios_with_unauthorized == 40
+    assert report.ambient_scenarios_with_unauthorized == 42
     assert report.capability_benign_completed == 30
     assert report.ambient_benign_completed == 30
+
+
+@pytest.mark.parametrize(
+    "name", ["short-lived-child-cannot-reset-counter", "attenuated-discharge-outlives-nonce"]
+)
+def test_expiry_and_attenuation_scenarios_are_contained(tmp_path: Path, name: str) -> None:
+    scenario = next(s for s in SCENARIOS if s.name == name)
+    capability = run_scenario(scenario, tmp_path / "cap", "capability")
+    ambient = run_scenario(scenario, tmp_path / "amb", "ambient")
+    assert capability.unauthorized == 0, capability.effects
+    assert capability.completed
+    assert ambient.unauthorized > 0
+
+
+def test_stateful_semantics_match_the_sequential_model() -> None:
+    # Before claim lifetimes were prefix-scoped, 100 sequences found 8 to 14 mismatches (seeds 1-3).
+    report = run_stateful(sequences=150, steps=40, seed=11)
+    assert report.examples == []
+    assert report.mismatches == 0
+    assert report.calls > 400
+    assert report.denied_by_state > 0
+    assert 0 < report.allowed < report.calls
 
 
 def test_a_single_scenario_result_explains_itself(tmp_path: Path) -> None:

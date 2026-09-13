@@ -31,12 +31,12 @@ FACTORIES: dict[str, Callable[[], StateStore]] = {
 }
 
 
-def counter(key: str, limit: int) -> StateClaim:
-    return StateClaim("max_calls", key, limit)
+def counter(key: str, limit: int, expires_at: int | None = None) -> StateClaim:
+    return StateClaim("max_calls", key, limit, expires_at)
 
 
-def once(key: str) -> StateClaim:
-    return StateClaim("once", key, 1)
+def once(key: str, expires_at: int | None = None) -> StateClaim:
+    return StateClaim("once", key, 1, expires_at)
 
 
 @pytest.fixture(params=sorted(FACTORIES))
@@ -45,7 +45,7 @@ def store(request: pytest.FixtureRequest) -> StateStore:
 
 
 def test_counters_admit_exactly_the_limit(store: StateStore) -> None:
-    results = [store.commit([counter("a", 3)], expires_at=NOW + 60, now=NOW) for _ in range(5)]
+    results = [store.commit([counter("a", 3, NOW + 60)], now=NOW) for _ in range(5)]
     assert [r.ok for r in results] == [True, True, True, False, False]
     assert results[-1] == CommitResult(False, "exhausted", "a")
     assert store.count("a") == 3
@@ -53,20 +53,18 @@ def test_counters_admit_exactly_the_limit(store: StateStore) -> None:
 
 def test_commits_are_all_or_nothing(store: StateStore) -> None:
     claims = [counter("wide", 10), counter("narrow", 1)]
-    assert store.commit(claims, expires_at=None, now=NOW).ok
-    denied = store.commit(claims, expires_at=None, now=NOW)
+    assert store.commit(claims, now=NOW).ok
+    denied = store.commit(claims, now=NOW)
     assert denied.reason == "exhausted"
     assert store.count("wide") == 1  # the wide counter was not incremented by the denied call
-    replay = store.commit([counter("wide", 10), once("n1")], expires_at=None, now=NOW)
+    replay = store.commit([counter("wide", 10), once("n1")], now=NOW)
     assert replay.ok
-    assert store.commit([counter("wide", 10), once("n1")], expires_at=None, now=NOW).reason == (
-        "replayed"
-    )
+    assert store.commit([counter("wide", 10), once("n1")], now=NOW).reason == ("replayed")
     assert store.count("wide") == 2
 
 
 def test_empty_commits_succeed(store: StateStore) -> None:
-    assert store.commit([], expires_at=None, now=NOW).ok
+    assert store.commit([], now=NOW).ok
 
 
 def test_revocation(store: StateStore) -> None:
@@ -82,9 +80,7 @@ def test_concurrent_commits_never_exceed_the_limit(store: StateStore) -> None:
 
     def worker() -> None:
         for _ in range(25):
-            ok = store.commit(
-                [counter("shared", 40), counter("other", 1000)], expires_at=None, now=NOW
-            ).ok
+            ok = store.commit([counter("shared", 40), counter("other", 1000)], now=NOW).ok
             with lock:
                 successes.append(ok)
 
@@ -122,7 +118,7 @@ def test_store_matches_a_sequential_model(
             (key not in used) if key.startswith("o") else counts[key] + 1 <= limit
             for key, limit in step
         )
-        assert store.commit(claims, expires_at=None, now=NOW).ok is expected_ok
+        assert store.commit(claims, now=NOW).ok is expected_ok
         if expected_ok:
             for key, _ in step:
                 if key.startswith("o"):
@@ -135,10 +131,10 @@ def test_store_matches_a_sequential_model(
 
 def test_memory_state_lives_until_shortly_after_the_token_expires() -> None:
     store = MemoryStateStore()
-    assert store.commit([counter("k", 1), once("n")], expires_at=NOW + 10, now=NOW).ok
-    assert not store.commit([counter("k", 1)], expires_at=NOW + 10, now=NOW).ok
+    assert store.commit([counter("k", 1, NOW + 10), once("n", NOW + 10)], now=NOW).ok
+    assert not store.commit([counter("k", 1, NOW + 10)], now=NOW).ok
     later = NOW + 10 + EXPIRY_GRACE_SECONDS + 1
-    assert store.commit([counter("k", 1), once("n")], expires_at=NOW + 10, now=later).ok
+    assert store.commit([counter("k", 1, NOW + 10), once("n", NOW + 10)], now=later).ok
     store.revoke("t", until=NOW, now=NOW)
     assert not store.is_revoked("t", now=later)
 
@@ -146,9 +142,41 @@ def test_memory_state_lives_until_shortly_after_the_token_expires() -> None:
 def test_redis_keys_expire_with_the_token() -> None:
     client = fakeredis.FakeRedis()
     store = RedisStateStore(client, prefix="test:")
-    assert store.commit([counter("k", 2), once("n")], expires_at=NOW + 100, now=NOW).ok
+    assert store.commit([counter("k", 2, NOW + 100), once("n", NOW + 100)], now=NOW).ok
     assert client.expiretime("test:calls:k") == NOW + 100 + EXPIRY_GRACE_SECONDS
     assert client.expiretime("test:once:n") == NOW + 100 + EXPIRY_GRACE_SECONDS
+
+
+def test_memory_commits_never_shorten_a_keys_lifetime() -> None:
+    store = MemoryStateStore()
+    assert store.commit([counter("k", 1, NOW + 900)], now=NOW).ok
+    assert store.commit([once("n", NOW + 900)], now=NOW).ok
+    # Claims for the same keys that arrive with an earlier expiry must not cut the lifetime short.
+    assert not store.commit([counter("k", 1, NOW + 1)], now=NOW).ok
+    assert not store.commit([once("n", NOW + 1)], now=NOW).ok
+    later = NOW + 1 + EXPIRY_GRACE_SECONDS + 1
+    assert store.commit([counter("k", 1, NOW + 900)], now=later).reason == "exhausted"
+    assert store.commit([once("n", NOW + 900)], now=later).reason == "replayed"
+    assert store.commit([counter("forever", 1, None)], now=NOW).ok
+    assert not store.commit([counter("forever", 1, NOW + 1)], now=NOW).ok
+    assert store.commit([counter("forever", 1, None)], now=NOW + 10**6).reason == "exhausted"
+
+
+def test_redis_commits_never_shorten_a_keys_lifetime() -> None:
+    client = fakeredis.FakeRedis()
+    store = RedisStateStore(client, prefix="test:")
+    assert store.commit([counter("k", 5, NOW + 900)], now=NOW).ok
+    assert store.commit([counter("k", 5, NOW + 1)], now=NOW).ok
+    assert client.expiretime("test:calls:k") == NOW + 900 + EXPIRY_GRACE_SECONDS
+    assert store.commit([counter("k", 5, NOW + 2000)], now=NOW).ok
+    assert client.expiretime("test:calls:k") == NOW + 2000 + EXPIRY_GRACE_SECONDS
+    assert store.commit([counter("p", 5, None)], now=NOW).ok
+    assert store.commit([counter("p", 5, NOW + 1)], now=NOW).ok
+    assert client.expiretime("test:calls:p") == -1
+    assert store.commit([counter("q", 5, NOW + 1)], now=NOW).ok
+    assert store.commit([counter("q", 5, None)], now=NOW).ok
+    assert client.expiretime("test:calls:q") == -1
+    assert store.count("q") == 2
 
 
 def test_redis_outages_fail_closed() -> None:
@@ -157,7 +185,7 @@ def test_redis_outages_fail_closed() -> None:
     store = RedisStateStore(fakeredis.FakeRedis(server=server))
     assert not store.ping()
     with pytest.raises(StateUnavailableError):
-        store.commit([counter("k", 1)], expires_at=None, now=NOW)
+        store.commit([counter("k", 1)], now=NOW)
     with pytest.raises(StateUnavailableError):
         store.revoke("t", until=None, now=NOW)
     with pytest.raises(StateUnavailableError):
@@ -176,7 +204,5 @@ def test_redis_contention_is_reported_after_bounded_retries(
         raise redis.WatchError
 
     monkeypatch.setattr(redis.client.Pipeline, "execute", always_conflict)
-    assert store.commit([counter("k", 5)], expires_at=None, now=NOW) == CommitResult(
-        False, "contention"
-    )
+    assert store.commit([counter("k", 5)], now=NOW) == CommitResult(False, "contention")
     assert len(attempts) == 3

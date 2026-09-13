@@ -234,3 +234,38 @@ def test_stateful_claims_are_shared_by_every_copy_of_a_token_prefix() -> None:
     assert isinstance(once, Authorization)
     assert once.claims[0].kind == "once"
     assert once.claims[0].limit == 1
+
+
+def test_claim_expiry_comes_from_the_prefix_every_holder_shares() -> None:
+    # A holder appends a short expiry after the parent's max_calls caveat. The counter is shared
+    # with the parent, so its lifetime must come from the caveats before it, not from the child.
+    parent = base("expires < 2030-01-01T00:00:00Z", "max_calls <= 3")
+    child = parent.add_first_party_caveat("expires < 2028-01-01T00:00:00Z")
+    grandchild = child.add_first_party_caveat("max_calls <= 1")
+    claims = []
+    for token in (parent, child, grandchild):
+        result = VERIFIER.verify(token, (), ctx())
+        assert isinstance(result, Authorization)
+        claims.append(result.claims)
+    assert claims[0][0].key == claims[1][0].key == claims[2][0].key
+    assert {c[0].expires_at for c in claims} == {1_893_456_000}  # 2030-01-01
+    assert claims[2][1].expires_at == 1_830_297_600  # 2028-01-01, the grandchild's own counter
+    assert isinstance(result, Authorization)
+    assert result.expires_at == 1_830_297_600
+    no_prefix_expiry = VERIFIER.verify(
+        base("max_calls <= 3", "expires < 2030-01-01T00:00:00Z"), (), ctx()
+    )
+    assert isinstance(no_prefix_expiry, Authorization)
+    assert no_prefix_expiry.claims[0].expires_at is None
+
+
+def test_discharge_nonce_expiry_ignores_expiries_a_holder_appends() -> None:
+    key, caveat_id = secrets.token_bytes(32), b"approval-like"
+    token = base().add_third_party_caveat(caveat_key=key, caveat_id=caveat_id)
+    discharge = _discharge(key, caveat_id, "expires < 2030-01-01T00:00:00Z", "once = " + "cd" * 16)
+    shortened = discharge.add_first_party_caveat("expires < 2028-01-01T00:00:00Z")
+    results = [VERIFIER.verify(token, (token.bind(d),), ctx()) for d in (discharge, shortened)]
+    assert all(isinstance(r, Authorization) for r in results)
+    claims = [r.claims[0] for r in results if isinstance(r, Authorization)]
+    assert claims[0].key == claims[1].key
+    assert claims[0].expires_at == claims[1].expires_at == 1_893_456_000

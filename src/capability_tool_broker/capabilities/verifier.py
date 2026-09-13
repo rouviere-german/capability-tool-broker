@@ -17,7 +17,11 @@ Phase 2 (authorization), in chain order, root first:
    match the request.
 6. Stateful caveats (``max_calls``, ``once``) become claims keyed by a hash of the chain signature
    right after the caveat, so every copy of the same token prefix shares one counter: delegating
-   a token to several sub-agents cannot multiply its call budget.
+   a token to several sub-agents cannot multiply its call budget. A claim's lifetime is the
+   earliest ``expires`` among the caveats *before* it in the same chain, which is exactly what
+   every holder of the key shares. Expiries a holder appends later never shorten it: otherwise a
+   short-lived child would make the store forget a counter (or a discharge's single-use nonce)
+   while the parent could still present it.
 
 The result is an :class:`Authorization` (claims still to be committed) or a :class:`Denial`.
 """
@@ -117,9 +121,13 @@ class Denial:
 
 @dataclass(frozen=True, slots=True)
 class StateClaim:
+    """A counter or nonce to commit. ``expires_at`` is the earliest expiry in the chain prefix
+    before the caveat (None: the prefix never expires), so every holder of ``key`` agrees on it."""
+
     kind: Literal["max_calls", "once"]
     key: str
     limit: int
+    expires_at: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +284,7 @@ class MacaroonVerifier:
         undischarged: Caveat | None = None
         for walk_index, walk in enumerate(walks):
             predicates: list[Predicate] = []
+            prefix_expiry: int | None = None  # earliest expiry so far in this chain
             for caveat_index, (caveat, _before, after) in enumerate(walk.steps):
                 if caveat.verification_id is not None:
                     if undischarged is not None or (walk_index, caveat_index) in links:
@@ -297,11 +306,16 @@ class MacaroonVerifier:
                 if isinstance(predicate, MaxCalls):
                     claims.append(
                         StateClaim(
-                            "max_calls", _claim_key(b"ctb-max-calls-v1", after), predicate.limit
+                            "max_calls",
+                            _claim_key(b"ctb-max-calls-v1", after),
+                            predicate.limit,
+                            prefix_expiry,
                         )
                     )
                 elif isinstance(predicate, Once):
-                    claims.append(StateClaim("once", _claim_key(b"ctb-once-v1", after), 1))
+                    claims.append(
+                        StateClaim("once", _claim_key(b"ctb-once-v1", after), 1, prefix_expiry)
+                    )
                 elif not evaluate(predicate, ctx):
                     return Denial(
                         DenyReason.CAVEAT_UNMET,
@@ -316,6 +330,9 @@ class MacaroonVerifier:
                 if isinstance(predicate, ExpiresBefore):
                     expires_at = (
                         predicate.at if expires_at is None else min(expires_at, predicate.at)
+                    )
+                    prefix_expiry = (
+                        predicate.at if prefix_expiry is None else min(prefix_expiry, predicate.at)
                     )
             if walk_index == 0:
                 root_predicates = tuple(predicates)

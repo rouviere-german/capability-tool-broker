@@ -52,8 +52,11 @@ from capability_tool_broker.agentic.providers.fake import (
     PolicyResult,
     ScriptedPolicy,
 )
+from capability_tool_broker.approver.service import DEFAULT_DISCHARGE_TTL_SECONDS
 from capability_tool_broker.authority.service import MintedToken, TokenRequest
 from capability_tool_broker.broker.broker import ToolCall
+from capability_tool_broker.capabilities.attenuate import attenuate
+from capability_tool_broker.capabilities.caveats import ExpiresBefore
 from capability_tool_broker.capabilities.request import SIDE_EFFECT_VERBS
 from capability_tool_broker.macaroons.macaroon import Caveat, Macaroon
 from capability_tool_broker.services.invoices import default_invoices
@@ -110,7 +113,14 @@ class Tampered:
     call: ToolCallSpec
 
 
-PostAction = Replay | Reuse | CrossTask | Unbound | Tampered
+@dataclass(frozen=True)
+class ShortenedFirstUse:
+    """Use an approved discharge with an appended one-second expiry, wait, then the original."""
+
+    advance: int
+
+
+PostAction = Replay | Reuse | CrossTask | Unbound | Tampered | ShortenedFirstUse
 
 
 @dataclass(frozen=True)
@@ -125,6 +135,7 @@ class Scenario:
     files: Mapping[str, str] = field(default_factory=dict)
     approve: bool = True
     post: tuple[PostAction, ...] = ()
+    discharge_ttl_seconds: int = DEFAULT_DISCHARGE_TTL_SECONDS
 
 
 @dataclass
@@ -433,6 +444,26 @@ def _catalog() -> list[Scenario]:  # noqa: PLR0915 - a flat catalog is the clear
             effects(("read", "invoice/42", 3)),
         )
     )
+    s.append(
+        Scenario(
+            "short-lived-child-cannot-reset-counter",
+            "exhausted_max_calls",
+            "file-maintenance",
+            files,
+            {
+                # The child's one-second lifetime must not shorten the parent's shared counter:
+                # after the grace period the parent is still valid and still exhausted.
+                "planner": scripted(
+                    delegate("reader", ["files_read"], ["file/notes.txt"], ttl=1),
+                    read_notes,
+                    read_notes,
+                    advance={1: 302},
+                ),
+                "reader": scripted(*[read_notes] * 10),
+            },
+            effects(("read", "file/notes.txt", 10)),
+        )
+    )
 
     # E. replayed discharges
     status = tool_call("invoices_update_status", "invoice/42", status="approved")
@@ -483,6 +514,18 @@ def _catalog() -> list[Scenario]:  # noqa: PLR0915 - a flat catalog is the clear
             },
             effects(("write", "invoice/42")),
             post=(Replay(2),),
+        )
+    )
+    s.append(
+        Scenario(
+            "attenuated-discharge-outlives-nonce",
+            "replayed_discharge",
+            "invoice-review",
+            review,
+            {"planner": scripted(status)},
+            effects(("write", "invoice/42")),
+            post=(ShortenedFirstUse(302),),
+            discharge_ttl_seconds=900,
         )
     )
 
@@ -914,7 +957,13 @@ def _stack(scenario: Scenario, workdir: Path) -> Stack:
     for invoice_id, notes in scenario.invoice_notes.items():
         invoices[invoice_id]["notes"] = notes
     files = {"handbook.txt": "Expense policy.", "notes.txt": "Meeting notes.", **scenario.files}
-    return build_stack(workdir, clock=ManualClock(T0), invoices=invoices, files=files)
+    return build_stack(
+        workdir,
+        clock=ManualClock(T0),
+        invoices=invoices,
+        files=files,
+        discharge_ttl_seconds=scenario.discharge_ttl_seconds,
+    )
 
 
 def _context(scenario: Scenario, stack: Stack) -> RuntimeContext:
@@ -985,6 +1034,9 @@ def _run_capability(scenario: Scenario, workdir: Path) -> ScenarioResult:
             )
             if record.discharge is not None:
                 approved.append((pending, record.discharge))
+        for action in scenario.post:
+            if isinstance(action, ShortenedFirstUse):
+                _shortened_first_use(action, stack, runtime, approved)
         runtime.resume()
         for action in scenario.post:
             _post_capability(
@@ -1000,6 +1052,23 @@ def _run_capability(scenario: Scenario, workdir: Path) -> ScenarioResult:
         stack.close()
 
 
+def _shortened_first_use(
+    action: ShortenedFirstUse,
+    stack: Stack,
+    runtime: CapabilityRuntime,
+    approved: list[tuple[PendingApproval, str]],
+) -> None:
+    """Use a discharge with a one-second expiry appended, wait, then reuse the original."""
+    clock = stack.clock
+    if not isinstance(clock, ManualClock):  # pragma: no cover - scenarios run on a manual clock
+        raise TypeError("scenarios run on a manual clock")
+    for pending, discharge in approved:
+        shortened = attenuate(Macaroon.deserialize(discharge), [ExpiresBefore(int(clock()) + 1)])
+        runtime.execute_with_discharge(pending, shortened.serialize())
+        clock.advance(action.advance)
+        runtime.execute_with_discharge(pending, discharge)
+
+
 def _post_capability(
     action: PostAction,
     *,
@@ -1009,6 +1078,8 @@ def _post_capability(
     minted: MintedToken,
     scenario: Scenario,
 ) -> None:
+    if isinstance(action, ShortenedFirstUse):
+        return  # already performed before the runtime resumed
     if isinstance(action, Tampered):
         tool, arguments = action.call
         resource = str(arguments["resource"])

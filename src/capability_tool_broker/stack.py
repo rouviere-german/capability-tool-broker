@@ -22,7 +22,7 @@ from pydantic import JsonValue
 
 from capability_tool_broker.agentic.approval import ApprovalStore
 from capability_tool_broker.agentic.audit import AuditLog
-from capability_tool_broker.approver.service import ApproverService
+from capability_tool_broker.approver.service import DEFAULT_DISCHARGE_TTL_SECONDS, ApproverService
 from capability_tool_broker.authority.policy import Policy
 from capability_tool_broker.authority.service import Authority
 from capability_tool_broker.broker.broker import Broker
@@ -174,6 +174,7 @@ def build_stack(
     files: Mapping[str, str] | None = None,
     tracer: Tracer | None = None,
     audit_name: str = "audit.jsonl",
+    discharge_ttl_seconds: int = DEFAULT_DISCHARGE_TTL_SECONDS,
 ) -> Stack:
     workdir.mkdir(parents=True, exist_ok=True)
     clock = clock or ManualClock()
@@ -211,7 +212,11 @@ def build_stack(
         ),
         approvals=approvals,
         approver=ApproverService(
-            private_key=keys.approver_private, store=approvals, audit=audit, clock=clock
+            private_key=keys.approver_private,
+            store=approvals,
+            audit=audit,
+            clock=clock,
+            discharge_ttl_seconds=discharge_ttl_seconds,
         ),
         router=router,
         invoices=invoice_service,

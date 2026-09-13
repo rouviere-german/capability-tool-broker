@@ -398,9 +398,7 @@ class Broker:
         try:
             if token_id is not None and self._state.is_revoked(token_id, now=now):
                 return Denial(DenyReason.REVOKED, "token has been revoked")
-            result = self._state.commit(
-                authorization.claims, expires_at=authorization.expires_at, now=now
-            )
+            result = self._state.commit(authorization.claims, now=now)
         except StateUnavailableError:
             return Denial(DenyReason.STATE_UNAVAILABLE, "state store unavailable")
         if result.ok:
