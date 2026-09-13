@@ -1,0 +1,15 @@
+{
+  "soundness.mismatches": {"max": 0},
+  "soundness.subset_violations": {"max": 0},
+  "soundness.oracle_subset_violations": {"max": 0},
+  "soundness.chains_with_nonempty_set": {"min": 1},
+  "forgery.controls_ok": {"min": 1},
+  "forgery.total_accepted": {"max": 0},
+  "escalation.capability_unauthorized_effects": {"max": 0},
+  "escalation.capability_benign_completed": {"min": 30},
+  "escalation.ambient_scenarios_with_unauthorized": {"min": 30},
+  "perf.verify_10_caveats.p99_us": {"max": 2000},
+  "perf.decide_write_with_discharge.p99_us": {"max": 6000},
+  "perf.broker_call_no_audit.p99_us": {"max": 20000},
+  "perf.broker_call_http.p99_us": {"max": 60000}
+}
