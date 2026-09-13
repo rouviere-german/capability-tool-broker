@@ -21,9 +21,9 @@ reset, so a store that forgets a counter while any holder can still present it i
 
 from __future__ import annotations
 
-import random
+import hashlib
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,7 +49,7 @@ from capability_tool_broker.macaroons.codec import b64u_encode
 from capability_tool_broker.macaroons.macaroon import Macaroon
 from capability_tool_broker.stack import ManualClock, Stack, build_stack
 
-__all__ = ["StatefulReport", "run_stateful"]
+__all__ = ["Draws", "StatefulReport", "run_stateful"]
 
 T0 = 1_800_000_000
 CLIENT = "agent-host"
@@ -70,6 +70,34 @@ _STATELESS = (
 )
 
 Spec = tuple[str, int | str]
+
+
+class Draws:
+    """Reproducible draws for test-case generation: SHA-256 over (seed, counter).
+
+    A failing sequence can be replayed from its seed. Not for cryptography (the tiny modulo bias
+    in :meth:`randint` and :meth:`choice` is irrelevant for generating test inputs).
+    """
+
+    def __init__(self, seed: int) -> None:
+        self._seed = f"ctb-stateful:{seed}:".encode("ascii")
+        self._counter = 0
+
+    def _next(self) -> int:
+        self._counter += 1
+        digest = hashlib.sha256(self._seed + self._counter.to_bytes(8, "big")).digest()
+        return int.from_bytes(digest[:8], "big")
+
+    def random(self) -> float:
+        """A float in [0, 1)."""
+        return self._next() / 2**64
+
+    def randint(self, low: int, high: int) -> int:
+        """An integer in [low, high]."""
+        return low + self._next() % (high - low + 1)
+
+    def choice[T](self, items: Sequence[T]) -> T:
+        return items[self._next() % len(items)]
 
 
 @dataclass
@@ -125,7 +153,7 @@ class StatefulReport:
 
 
 class _Sequence:
-    def __init__(self, stack: Stack, clock: ManualClock, rng: random.Random, state: StateStore):
+    def __init__(self, stack: Stack, clock: ManualClock, rng: Draws, state: StateStore):
         self.stack = stack
         self.clock = clock
         self.rng = rng
@@ -279,7 +307,7 @@ def run_stateful(
     workdir: Path | None = None,
     store_factory: Callable[[], StateStore] = MemoryStateStore,
 ) -> StatefulReport:
-    rng = random.Random(seed)  # noqa: S311 - deterministic test-case generation, not cryptography
+    rng = Draws(seed)
     with tempfile.TemporaryDirectory() as tmp:
         clock = ManualClock(T0)
         stack = build_stack(workdir or Path(tmp), clock=clock)

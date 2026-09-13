@@ -3,6 +3,8 @@
   "soundness.subset_violations": {"max": 0},
   "soundness.oracle_subset_violations": {"max": 0},
   "soundness.chains_with_nonempty_set": {"min": 1},
+  "stateful.mismatches": {"max": 0},
+  "stateful.denied_by_state": {"min": 1},
   "forgery.controls_ok": {"min": 1},
   "forgery.total_accepted": {"max": 0},
   "escalation.capability_unauthorized_effects": {"max": 0},

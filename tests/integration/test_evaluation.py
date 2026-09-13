@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import random
+from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
 
@@ -11,6 +12,8 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from capability_tool_broker.broker.state import CommitResult, MemoryStateStore
+from capability_tool_broker.capabilities.verifier import StateClaim
 from capability_tool_broker.evaluation.forgery import run_forgery
 from capability_tool_broker.evaluation.perf import percentile, run_perf
 from capability_tool_broker.evaluation.scenarios import (
@@ -107,8 +110,23 @@ def test_expiry_and_attenuation_scenarios_are_contained(tmp_path: Path, name: st
     assert ambient.unauthorized > 0
 
 
+class _AmnesiacStore(MemoryStateStore):
+    """Admits every commit: a broker on this store ignores max_calls and once."""
+
+    def commit(self, claims: Sequence[StateClaim], *, now: int) -> CommitResult:
+        return CommitResult(True)
+
+
+def test_the_stateful_model_detects_a_store_that_forgets_its_state() -> None:
+    report = run_stateful(sequences=20, steps=40, seed=3, store_factory=_AmnesiacStore)
+    assert report.mismatches > 0
+    assert report.examples
+    assert all("model allowed=False" in example for example in report.examples)
+
+
 def test_stateful_semantics_match_the_sequential_model() -> None:
-    # Before claim lifetimes were prefix-scoped, 100 sequences found 8 to 14 mismatches (seeds 1-3).
+    # Before claim lifetimes were prefix-scoped, this harness (then drawing from random.Random)
+    # found 8 to 14 mismatches per 100 sequences for seeds 1 to 3.
     report = run_stateful(sequences=150, steps=40, seed=11)
     assert report.examples == []
     assert report.mismatches == 0
@@ -150,6 +168,25 @@ def _bench_module(repo_root: Path) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_bench_reports_the_median_and_range_of_repeated_latency_runs(repo_root: Path) -> None:
+    bench = _bench_module(repo_root)
+    runs = [
+        {"verify": {"runs": 10.0, "p50_us": p50, "p99_us": p99, "mean_us": p50 + 1}}
+        for p50, p99 in ((100.0, 900.0), (120.0, 500.0), (90.0, 2000.0))
+    ]
+    assert bench.summarize_perf(runs) == {
+        "verify": {
+            "runs": 10.0,
+            "repeats": 3.0,
+            "p50_us": 100.0,
+            "p99_us": 900.0,
+            "mean_us": 101.0,
+            "p99_min_us": 500.0,
+            "p99_max_us": 2000.0,
+        }
+    }
 
 
 def test_bench_threshold_checks(repo_root: Path) -> None:
