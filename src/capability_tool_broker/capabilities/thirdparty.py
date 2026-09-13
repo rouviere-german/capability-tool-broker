@@ -5,8 +5,10 @@ The caveat id is canonical JSON::
     {"v": 1, "purpose": "approval", "location": <approver URL>, "scope": <caveat condition>,
      "kid": <root key id>, "box": <sealed box>, "tag": <authority tag>}
 
-- ``box`` seals ``{"v", "caveat_key", "task_id", "expires_at"}`` to the approver's X25519 public
-  key. Only the approver can open it; the caveat key is never stored by the approver queue.
+- ``box`` seals ``{"v", "caveat_key", "task_id", "client_id", "expires_at"}`` to the approver's
+  X25519 public key. Only the approver can open it; the caveat key is never stored by the approver
+  queue. ``client_id`` is the client the authority minted the token for: the approver accepts
+  approval requests for the caveat only from that client.
 - ``scope`` is a stateless first-party condition (by default ``verb in write,delete``). The caveat
   must be discharged only for requests the scope matches, so reads with the same token need no
   approval. The scope is covered by the macaroon chain, so a holder cannot change it.
@@ -35,7 +37,7 @@ from capability_tool_broker.capabilities.caveats import (
     parse_caveat,
 )
 from capability_tool_broker.capabilities.keys import RootKeyRing
-from capability_tool_broker.capabilities.request import TASK_ID_PATTERN
+from capability_tool_broker.capabilities.request import CLIENT_ID_PATTERN, TASK_ID_PATTERN
 from capability_tool_broker.capabilities.sealed import open_sealed, seal
 from capability_tool_broker.core.canonical import CanonicalJSONError, canonical_json
 from capability_tool_broker.macaroons.codec import b64u_decode, b64u_encode
@@ -94,6 +96,7 @@ class ApprovalBox(BaseModel):
     v: Literal[1] = 1
     caveat_key: str
     task_id: str = Field(pattern=TASK_ID_PATTERN)
+    client_id: str = Field(pattern=CLIENT_ID_PATTERN)
     expires_at: int
 
 
@@ -111,6 +114,7 @@ def add_approval_caveat(
     approver_public_key: X25519PublicKey,
     location: str,
     task_id: str,
+    client_id: str,
     expires_at: int,
     scope: str = DEFAULT_APPROVAL_SCOPE,
 ) -> Macaroon:
@@ -119,7 +123,12 @@ def add_approval_caveat(
     if is_stateful(predicate):
         raise ValueError("an approval scope must be a stateless condition")
     caveat_key = secrets.token_bytes(32)
-    box = ApprovalBox(caveat_key=b64u_encode(caveat_key), task_id=task_id, expires_at=expires_at)
+    box = ApprovalBox(
+        caveat_key=b64u_encode(caveat_key),
+        task_id=task_id,
+        client_id=client_id,
+        expires_at=expires_at,
+    )
     sealed = seal(
         approver_public_key,
         canonical_json(box.model_dump(mode="json")).encode("utf-8"),

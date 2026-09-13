@@ -122,6 +122,7 @@ class Authority:
                 approver_public_key=self._approver,
                 location=self._policy.approver_location,
                 task_id=request.task_id,
+                client_id=client_id,
                 expires_at=expires_at,
                 scope=spec.approval_scope or DEFAULT_APPROVAL_SCOPE,
             )

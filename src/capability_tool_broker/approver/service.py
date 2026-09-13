@@ -2,8 +2,9 @@
 
 Submitting: an agent host sends the approval caveat id from its token and the full canonical
 request. The approver opens the sealed caveat id with its private key (refusing ids not sealed to
-it), checks that the task id in the sealed box equals the request's task, that the caveat has not
-expired and that the caveat's scope covers the request, and queues the request for a human.
+it), checks that the task id in the sealed box equals the request's task, that the authenticated
+requester is the client the token was minted for, that the caveat has not expired and that the
+caveat's scope covers the request, and queues the request for a human.
 
 Deciding: after a human approves the exact request (``capability-tool-broker approver review``),
 the approver re-opens the caveat id and mints a discharge macaroon keyed with the caveat key and
@@ -112,6 +113,10 @@ class ApproverService:
         now = int(self._clock())
         if opened.box.task_id != request.task_id:
             raise ApproverError("task_mismatch", "request belongs to a different task")
+        if opened.box.client_id != requested_by:
+            raise ApproverError(
+                "client_mismatch", "only the client the token was minted for may request approval"
+            )
         if opened.box.expires_at <= now:
             raise ApproverError("caveat_expired", "the approval caveat has expired")
         try:

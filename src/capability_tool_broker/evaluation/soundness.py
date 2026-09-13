@@ -294,6 +294,7 @@ def _extend(system: _System, token: Macaroon, specs: Sequence[Spec]) -> Macaroon
                 approver_public_key=system.approver_public,  # type: ignore[arg-type]
                 location="https://approver.internal/v1",
                 task_id=TASK,
+                client_id=CLIENT,
                 expires_at=T0 + 10_000,
                 scope=f"verb in {','.join(spec.values)}",
             )

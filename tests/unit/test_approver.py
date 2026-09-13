@@ -89,6 +89,15 @@ def test_submissions_are_validated_against_the_sealed_caveat(stack: Stack) -> No
     assert expired.value.code == "caveat_expired"
 
 
+def test_only_the_client_the_token_was_minted_for_can_request_approval(stack: Stack) -> None:
+    outcome = write_denial(stack)
+    with pytest.raises(ApproverError) as foreign:
+        stack.approver.submit(submission(outcome), requested_by="other-client")
+    assert foreign.value.code == "client_mismatch"
+    assert stack.approver.pending() == []
+    assert stack.approver.submit(submission(outcome), requested_by=CLIENT).requested_by == CLIENT
+
+
 def test_caveats_sealed_to_another_approver_are_refused(stack: Stack) -> None:
     outcome = write_denial(stack)
     other = ApproverService(private_key=generate_private_key(), store=ApprovalStore())

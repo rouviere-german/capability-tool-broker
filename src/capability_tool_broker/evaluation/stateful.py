@@ -160,6 +160,7 @@ class _Sequence:
             approver_public_key=stack.keys.approver_private.public_key(),
             location="https://approver.internal/v1",
             task_id=TASK,
+            client_id=CLIENT,
             expires_at=now + ROOT_TTL,
         )
         specs: tuple[Spec, ...] = (

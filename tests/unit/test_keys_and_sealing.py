@@ -149,6 +149,7 @@ def _approval_token() -> tuple[Macaroon, RootKeyRing, X25519PrivateKey]:
         approver_public_key=approver.public_key(),
         location="https://approver.internal/v1",
         task_id="task-1",
+        client_id="agent-host",
         expires_at=1_800_000_600,
     )
     return token, ring, approver
@@ -160,6 +161,7 @@ def test_approval_caveat_ids_open_for_the_approver_and_verify_for_the_ring() -> 
     opened = open_approval_caveat(caveat_id, approver)
     assert opened is not None
     assert opened.box.task_id == "task-1"
+    assert opened.box.client_id == "agent-host"
     assert approval_tag_valid(ring, caveat_id, derive_key(opened.caveat_key))
     assert not approval_tag_valid(ring, caveat_id, derive_key(b"other"))
     assert not approval_tag_valid(
@@ -196,7 +198,13 @@ def test_non_canonical_or_broken_caveat_ids_are_not_approval_caveats() -> None:
                 seal(
                     approver.public_key(),
                     json.dumps(
-                        {"v": 1, "caveat_key": b64u_encode(b"x"), "task_id": "t", "expires_at": 1}
+                        {
+                            "v": 1,
+                            "caveat_key": b64u_encode(b"x"),
+                            "task_id": "t",
+                            "client_id": "agent-host",
+                            "expires_at": 1,
+                        }
                     ).encode(),
                     context=b"ctb-approval-box-v1",
                 )
@@ -215,6 +223,7 @@ def test_non_canonical_or_broken_caveat_ids_are_not_approval_caveats() -> None:
             approver_public_key=approver.public_key(),
             location="https://approver.internal/v1",
             task_id="task-1",
+            client_id="agent-host",
             expires_at=1,
             scope="max_calls <= 1",
         )

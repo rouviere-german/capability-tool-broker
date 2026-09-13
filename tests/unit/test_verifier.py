@@ -196,6 +196,7 @@ def test_approval_caveats_apply_only_to_requests_in_scope() -> None:
         approver_public_key=approver,
         location="https://approver.internal/v1",
         task_id="task-1",
+        client_id="agent-host",
         expires_at=NOW + 600,
     )
     assert isinstance(VERIFIER.verify(token, (), ctx()), Authorization)
