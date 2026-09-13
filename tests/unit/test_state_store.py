@@ -1,0 +1,182 @@
+"""Counters, single-use nonces and revocation, for the in-memory and the Redis store."""
+
+from __future__ import annotations
+
+import threading
+from collections import Counter
+from collections.abc import Callable
+
+import fakeredis
+import pytest
+import redis
+from hypothesis import given
+from hypothesis import strategies as st
+
+from capability_tool_broker.broker.state import (
+    EXPIRY_GRACE_SECONDS,
+    CommitResult,
+    MemoryStateStore,
+    RedisStateStore,
+    StateStore,
+    StateUnavailableError,
+)
+from capability_tool_broker.capabilities.verifier import StateClaim
+
+pytestmark = pytest.mark.unit
+
+NOW = 1_800_000_000
+FACTORIES: dict[str, Callable[[], StateStore]] = {
+    "memory": MemoryStateStore,
+    "redis": lambda: RedisStateStore(fakeredis.FakeRedis()),
+}
+
+
+def counter(key: str, limit: int) -> StateClaim:
+    return StateClaim("max_calls", key, limit)
+
+
+def once(key: str) -> StateClaim:
+    return StateClaim("once", key, 1)
+
+
+@pytest.fixture(params=sorted(FACTORIES))
+def store(request: pytest.FixtureRequest) -> StateStore:
+    return FACTORIES[str(request.param)]()
+
+
+def test_counters_admit_exactly_the_limit(store: StateStore) -> None:
+    results = [store.commit([counter("a", 3)], expires_at=NOW + 60, now=NOW) for _ in range(5)]
+    assert [r.ok for r in results] == [True, True, True, False, False]
+    assert results[-1] == CommitResult(False, "exhausted", "a")
+    assert store.count("a") == 3
+
+
+def test_commits_are_all_or_nothing(store: StateStore) -> None:
+    claims = [counter("wide", 10), counter("narrow", 1)]
+    assert store.commit(claims, expires_at=None, now=NOW).ok
+    denied = store.commit(claims, expires_at=None, now=NOW)
+    assert denied.reason == "exhausted"
+    assert store.count("wide") == 1  # the wide counter was not incremented by the denied call
+    replay = store.commit([counter("wide", 10), once("n1")], expires_at=None, now=NOW)
+    assert replay.ok
+    assert store.commit([counter("wide", 10), once("n1")], expires_at=None, now=NOW).reason == (
+        "replayed"
+    )
+    assert store.count("wide") == 2
+
+
+def test_empty_commits_succeed(store: StateStore) -> None:
+    assert store.commit([], expires_at=None, now=NOW).ok
+
+
+def test_revocation(store: StateStore) -> None:
+    assert not store.is_revoked("abc", now=NOW)
+    store.revoke("abc", until=NOW + 60, now=NOW)
+    assert store.is_revoked("abc", now=NOW)
+    assert store.ping()
+
+
+def test_concurrent_commits_never_exceed_the_limit(store: StateStore) -> None:
+    successes: list[bool] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        for _ in range(25):
+            ok = store.commit(
+                [counter("shared", 40), counter("other", 1000)], expires_at=None, now=NOW
+            ).ok
+            with lock:
+                successes.append(ok)
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert successes.count(True) == 40
+    assert store.count("shared") == 40
+    assert store.count("other") == 40
+
+
+@given(
+    kind=st.sampled_from(sorted(FACTORIES)),
+    operations=st.lists(
+        st.lists(
+            st.tuples(st.sampled_from(["c1", "c2", "o1", "o2"]), st.integers(1, 3)),
+            min_size=1,
+            max_size=3,
+            unique_by=lambda item: item[0],
+        ),
+        max_size=12,
+    ),
+)
+def test_store_matches_a_sequential_model(
+    kind: str, operations: list[list[tuple[str, int]]]
+) -> None:
+    store = FACTORIES[kind]()
+    counts: Counter[str] = Counter()
+    used: set[str] = set()
+    for step in operations:
+        claims = [once(key) if key.startswith("o") else counter(key, limit) for key, limit in step]
+        expected_ok = all(
+            (key not in used) if key.startswith("o") else counts[key] + 1 <= limit
+            for key, limit in step
+        )
+        assert store.commit(claims, expires_at=None, now=NOW).ok is expected_ok
+        if expected_ok:
+            for key, _ in step:
+                if key.startswith("o"):
+                    used.add(key)
+                else:
+                    counts[key] += 1
+    for key in ("c1", "c2"):
+        assert store.count(key) == counts[key]
+
+
+def test_memory_state_lives_until_shortly_after_the_token_expires() -> None:
+    store = MemoryStateStore()
+    assert store.commit([counter("k", 1), once("n")], expires_at=NOW + 10, now=NOW).ok
+    assert not store.commit([counter("k", 1)], expires_at=NOW + 10, now=NOW).ok
+    later = NOW + 10 + EXPIRY_GRACE_SECONDS + 1
+    assert store.commit([counter("k", 1), once("n")], expires_at=NOW + 10, now=later).ok
+    store.revoke("t", until=NOW, now=NOW)
+    assert not store.is_revoked("t", now=later)
+
+
+def test_redis_keys_expire_with_the_token() -> None:
+    client = fakeredis.FakeRedis()
+    store = RedisStateStore(client, prefix="test:")
+    assert store.commit([counter("k", 2), once("n")], expires_at=NOW + 100, now=NOW).ok
+    assert client.expiretime("test:calls:k") == NOW + 100 + EXPIRY_GRACE_SECONDS
+    assert client.expiretime("test:once:n") == NOW + 100 + EXPIRY_GRACE_SECONDS
+
+
+def test_redis_outages_fail_closed() -> None:
+    server = fakeredis.FakeServer()
+    server.connected = False
+    store = RedisStateStore(fakeredis.FakeRedis(server=server))
+    assert not store.ping()
+    with pytest.raises(StateUnavailableError):
+        store.commit([counter("k", 1)], expires_at=None, now=NOW)
+    with pytest.raises(StateUnavailableError):
+        store.revoke("t", until=None, now=NOW)
+    with pytest.raises(StateUnavailableError):
+        store.is_revoked("t", now=NOW)
+
+
+def test_redis_contention_is_reported_after_bounded_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = fakeredis.FakeRedis()
+    store = RedisStateStore(client, max_retries=3)
+    attempts: list[int] = []
+
+    def always_conflict(self: object, *args: object, **kwargs: object) -> None:
+        attempts.append(1)
+        raise redis.WatchError
+
+    monkeypatch.setattr(redis.client.Pipeline, "execute", always_conflict)
+    assert store.commit([counter("k", 5)], expires_at=None, now=NOW) == CommitResult(
+        False, "contention"
+    )
+    assert len(attempts) == 3

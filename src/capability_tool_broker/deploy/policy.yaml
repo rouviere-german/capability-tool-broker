@@ -1,0 +1,67 @@
+# Task policy for the authority. Clients request a template by name and supply parameter values;
+# values must match the pattern and be literal resource segments (no wildcards).
+version: 1
+approver_location: "https://approver.internal/v1"
+max_ttl_seconds: 900
+
+clients:
+  agent-host:
+    templates: [invoice-review, invoice-audit, invoice-cleanup, file-maintenance, customer-notice]
+
+templates:
+  invoice-review:
+    description: Read one invoice and set its status (status changes need human approval).
+    params:
+      invoice_id: "[0-9]{1,6}"
+    tools: [invoices_read, invoices_update_status]
+    verbs: [read, write]
+    resources: ["invoice/{invoice_id}"]
+    hosts: [invoices.internal]
+    ttl_seconds: 600
+    max_calls: 20
+    budget: {steps: 20, tokens: 60000, usd: 0.5}
+
+  invoice-audit:
+    description: Read any invoice, nothing else.
+    tools: [invoices_read]
+    verbs: [read]
+    resources: ["invoice/*"]
+    hosts: [invoices.internal]
+    ttl_seconds: 900
+    max_calls: 100
+    budget: {steps: 40, tokens: 120000, usd: 1.0}
+
+  invoice-cleanup:
+    description: Read and delete one invoice (deletion needs human approval).
+    params:
+      invoice_id: "[0-9]{1,6}"
+    tools: [invoices_read, invoices_delete]
+    verbs: [read, delete]
+    resources: ["invoice/{invoice_id}"]
+    ttl_seconds: 300
+    max_calls: 5
+    budget: {steps: 10, tokens: 30000, usd: 0.25}
+
+  file-maintenance:
+    description: Read, write and delete one file in the shared store.
+    params:
+      name: "[a-z0-9][a-z0-9._-]{0,63}"
+    tools: [files_read, files_write, files_delete]
+    verbs: [read, write, delete]
+    resources: ["file/{name}"]
+    hosts: [files.internal]
+    ttl_seconds: 600
+    max_calls: 10
+    budget: {steps: 15, tokens: 40000, usd: 0.3}
+
+  customer-notice:
+    description: Read one invoice and e-mail recipients in the customer's domain.
+    params:
+      invoice_id: "[0-9]{1,6}"
+      domain: "[a-z0-9.-]{1,64}"
+    tools: [invoices_read, mail_send]
+    verbs: [read, write]
+    resources: ["invoice/{invoice_id}", "mail/*@{domain}"]
+    ttl_seconds: 600
+    max_calls: 10
+    budget: {steps: 15, tokens: 40000, usd: 0.3}

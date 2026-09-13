@@ -1,0 +1,89 @@
+# Tool manifest body. `capability-tool-broker sign-manifest` signs it with the manifest key; the
+# broker refuses to run tools from an unsigned or modified manifest.
+v: 1
+issuer: capability-tool-broker
+issued_at: 0
+tools:
+  - name: invoices_read
+    description: Read one invoice (customer, amount, status and free-text notes).
+    service: invoices
+    host: invoices.internal
+    effect: read
+    method: GET
+    resource_template: "invoice/{invoice_id}"
+    path_template: "/invoices/{invoice_id}"
+    required_caveats: [task_id, expires, resource]
+    max_output_bytes: 2048
+
+  - name: invoices_update_status
+    description: Set the status of one invoice.
+    service: invoices
+    host: invoices.internal
+    effect: write
+    method: PUT
+    resource_template: "invoice/{invoice_id}"
+    path_template: "/invoices/{invoice_id}/status"
+    args:
+      status: {type: string, enum: [open, approved, paid, rejected]}
+    required_caveats: [task_id, expires, resource, tool]
+    max_output_bytes: 2048
+
+  - name: invoices_delete
+    description: Delete one invoice.
+    service: invoices
+    host: invoices.internal
+    effect: delete
+    method: DELETE
+    resource_template: "invoice/{invoice_id}"
+    path_template: "/invoices/{invoice_id}"
+    required_caveats: [task_id, expires, resource, tool]
+    max_output_bytes: 512
+
+  - name: files_read
+    description: Read a text file from the shared file store.
+    service: files
+    host: files.internal
+    effect: read
+    method: GET
+    resource_template: "file/{name}"
+    path_template: "/files/{name}"
+    required_caveats: [task_id, expires, resource]
+    max_output_bytes: 4096
+
+  - name: files_write
+    description: Create or replace a text file in the shared file store.
+    service: files
+    host: files.internal
+    effect: write
+    method: PUT
+    resource_template: "file/{name}"
+    path_template: "/files/{name}"
+    args:
+      content: {type: string, max_length: 4096}
+    required_caveats: [task_id, expires, resource, tool]
+    max_output_bytes: 512
+
+  - name: files_delete
+    description: Delete a file from the shared file store.
+    service: files
+    host: files.internal
+    effect: delete
+    method: DELETE
+    resource_template: "file/{name}"
+    path_template: "/files/{name}"
+    required_caveats: [task_id, expires, resource, tool]
+    max_output_bytes: 512
+
+  - name: mail_send
+    description: Send an e-mail to one recipient.
+    service: mailer
+    host: mailer.internal
+    effect: external
+    method: POST
+    resource_template: "mail/{to}"
+    path_template: "/messages/{to}"
+    args:
+      subject: {type: string, max_length: 200}
+      body: {type: string, max_length: 4000}
+    required_caveats: [task_id, expires, resource, tool]
+    max_output_bytes: 512
