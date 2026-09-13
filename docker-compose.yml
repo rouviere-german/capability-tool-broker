@@ -1,0 +1,133 @@
+# Local stack: one locally built image with four role entrypoints, the bundled fake services and
+# Redis. Every service receives only its own role's variables, which
+# tests/integration/test_no_ambient_authority.py checks.
+#
+#   uv run capability-tool-broker keygen --out .env
+#   set -a && . ./.env && set +a
+#   uv run capability-tool-broker sign-manifest --out deploy/local/manifest.signed.json
+#   docker compose up --build -d
+#   docker compose run --rm agent-host e2e start
+#   docker compose exec approver capability-tool-broker approver review   # a human decides
+#   docker compose run --rm agent-host e2e resume
+#
+# The Redis image is pinned by tag; pin it by digest before publishing (see .github/workflows/ci.yml).
+
+x-hardening: &hardening
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 128
+  mem_limit: 256m
+  cpus: 0.5
+  restart: unless-stopped
+
+x-app: &app
+  <<: *hardening
+  build:
+    context: .
+  image: capability-tool-broker:local
+
+services:
+  redis:
+    <<: *hardening
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    tmpfs:
+      - /data:size=64m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  services:
+    <<: *app
+    command: ["serve", "services"]
+    environment:
+      APP_ENVIRONMENT: prod
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8090"
+      APP_RATE_LIMIT_PER_SECOND: "200"
+      APP_RATE_LIMIT_BURST: "400"
+      SERVICES_CREDENTIALS: ${SERVICES_CREDENTIALS:?run keygen first}
+      SERVICES_DEMO_DATA: "true"
+
+  authority:
+    <<: *app
+    command: ["serve", "authority"]
+    ports:
+      - "127.0.0.1:8001:8001"
+    environment:
+      APP_ENVIRONMENT: prod
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8001"
+      AUTHORITY_ROOT_KEYS: ${AUTHORITY_ROOT_KEYS:?run keygen first}
+      AUTHORITY_APPROVER_PUBLIC_KEY: ${AUTHORITY_APPROVER_PUBLIC_KEY:?run keygen first}
+      AUTHORITY_CLIENT_PUBLIC_KEYS: ${AUTHORITY_CLIENT_PUBLIC_KEYS:?run keygen first}
+      AUTHORITY_AUDIT_PATH: /tmp/authority-audit.jsonl
+
+  approver:
+    <<: *app
+    command: ["serve", "approver"]
+    ports:
+      - "127.0.0.1:8003:8003"
+    environment:
+      APP_ENVIRONMENT: prod
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8003"
+      APPROVER_PRIVATE_KEY: ${APPROVER_PRIVATE_KEY:?run keygen first}
+      APPROVER_CLIENT_PUBLIC_KEYS: ${APPROVER_CLIENT_PUBLIC_KEYS:?run keygen first}
+      APPROVER_STORE_PATH: /tmp/approvals.json
+      APPROVER_AUDIT_PATH: /tmp/approver-audit.jsonl
+
+  broker:
+    <<: *app
+    command: ["serve", "broker"]
+    ports:
+      - "127.0.0.1:8002:8002"
+    depends_on:
+      redis:
+        condition: service_healthy
+      services:
+        condition: service_started
+    environment:
+      APP_ENVIRONMENT: prod
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8002"
+      BROKER_ROOT_KEYS: ${BROKER_ROOT_KEYS:?run keygen first}
+      BROKER_MANIFEST_PUBLIC_KEYS: ${BROKER_MANIFEST_PUBLIC_KEYS:?run keygen first}
+      BROKER_SERVICE_CREDENTIALS: ${BROKER_SERVICE_CREDENTIALS:?run keygen first}
+      BROKER_CLIENT_PUBLIC_KEYS: ${BROKER_CLIENT_PUBLIC_KEYS:?run keygen first}
+      BROKER_MANIFEST_PATH: /run/manifest/manifest.signed.json
+      BROKER_SERVICE_BASE_URL: http://services:8090
+      BROKER_REDIS_URL: redis://redis:6379/0
+      BROKER_AUDIT_PATH: /tmp/broker-audit.jsonl
+    volumes:
+      - ./deploy/local/manifest.signed.json:/run/manifest/manifest.signed.json:ro
+
+  agent-host:
+    <<: *app
+    profiles: ["e2e"]
+    restart: "no"
+    command: ["e2e", "start"]
+    depends_on:
+      - authority
+      - approver
+      - broker
+    environment:
+      AGENT_CLIENT_ID: ${AGENT_CLIENT_ID:-agent-host}
+      AGENT_CLIENT_PRIVATE_KEY: ${AGENT_CLIENT_PRIVATE_KEY:?run keygen first}
+      AGENT_MANIFEST_PUBLIC_KEYS: ${BROKER_MANIFEST_PUBLIC_KEYS:?run keygen first}
+      AGENT_AUTHORITY_URL: http://authority:8001
+      AGENT_BROKER_URL: http://broker:8002
+      AGENT_APPROVER_URL: http://approver:8003
+      AGENT_STATE_PATH: /state/e2e.json
+    volumes:
+      - agent-state:/state
+
+volumes:
+  agent-state:
