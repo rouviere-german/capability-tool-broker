@@ -98,7 +98,7 @@ CPU; no API key is needed.
 uv sync --frozen
 uv run python tasks.py demo        # delegation, contained injection, CLI approval, replay denied
 uv run python tasks.py test        # pytest with coverage (floor 85%)
-uv run python tasks.py bench       # soundness, forgery, escalation, latency with thresholds
+uv run python tasks.py bench       # soundness, stateful, forgery, escalation, latency
 uv run python tasks.py lint typecheck audit baseline
 ```
 
@@ -135,11 +135,12 @@ uv run python bench/bench_baseline.py --check
 ```
 
 on Windows 10 (10.0.19045), Python 3.12.14, an Intel64 Family 6 Model 158 CPU with 6 logical cores,
-CPU only, offline. Section run times: soundness 270.1 s, forgery 1.6 s, escalation 5.4 s,
-latency 14.2 s (4 min 53 s in total). The script exited 0 with "all benchmarks within thresholds";
-CI enforces the same thresholds (`bench/thresholds.json`). Output copied verbatim:
+CPU only, offline. Section run times: soundness 255.1 s, stateful 13.2 s, forgery 1.6 s,
+escalation 6.4 s, latency 67.8 s (5 min 46 s in total). The script exited 0 with "all benchmarks
+within thresholds"; CI enforces the same thresholds (`bench/thresholds.json`). Tables copied
+verbatim:
 
-### Soundness (exhaustive oracle)
+### Soundness (reference evaluator over a 900-request universe)
 
 | chains | requests/chain | verifications | mismatches | child not subset | non-empty |
 |---:|---:|---:|---:|---:|---:|
@@ -151,21 +152,39 @@ Universe: 5 tools x 20 resources x 3 verbs x 3 time steps. Each chain has 1 to 6
 (task, client, tool, verb, host, resource globs, expiry, argument predicates, `max_calls`, scoped
 approval caveats); each child appends 1 to 3 more. The reference evaluator shares no code with the
 DSL, parser, glob matcher or verifier. 1,128 of 2,000 parents authorize at least one request, so the
-comparison is not dominated by empty sets.
+comparison is not dominated by empty sets. The check is exhaustive over the 900 requests for each
+of the 2,000 chains, which is a finite sample of chains, not a proof.
+
+### Stateful semantics (sequential model)
+
+| sequences | steps | calls | allowed | denied by state | mismatches |
+|---:|---:|---:|---:|---:|---:|
+| 1000 | 40000 | 16617 | 3043 | 3099 | 0 |
+
+The soundness oracle checks stateless decisions only. Each of these sequences drives the full
+broker (verifier, approval policy, state store) through 40 random steps: reads with the root token
+or any delegated descendant, delegations that append a short expiry and/or a `max_calls` caveat,
+human approvals, discharges with an appended expiry, writes with any token and discharge, and
+clock jumps of 1 to 400 s (past the state store's 300 s grace period). The reference model tracks
+every counter by the caveat prefix its holders share and every approval by id, and never forgets
+state, so a store that drops a counter or nonce while some holder can still present it is a
+mismatch. 3,099 of 16,617 calls were denied by state alone (exhausted counters or used approvals).
+`tests/integration/test_evaluation.py::test_the_stateful_model_detects_a_store_that_forgets_its_state`
+shows that the harness reports mismatches for a store that admits every commit.
 
 ### Forgery suite
 
 | category | attempts | accepted |
 |---|---:|---:|
-| byte_flips_token | 2241 | 0 |
-| byte_flips_discharge | 1797 | 0 |
-| base64_mutations | 1992 | 0 |
+| byte_flips_token | 2340 | 0 |
+| byte_flips_discharge | 1896 | 0 |
+| base64_mutations | 2080 | 0 |
 | caveat_removal | 33 | 0 |
 | caveat_reordering | 21 | 0 |
 | signature_splicing | 10 | 0 |
 | discharge_misuse | 9 | 0 |
 | key_confusion | 3 | 0 |
-| **total** | 6106 | 0 |
+| **total** | 6392 | 0 |
 
 Controls (valid read, approved write, attenuated read) accepted: True
 
@@ -176,41 +195,47 @@ Controls (valid read, approved write, attenuated read) accepted: True
 | undelegated_tool | 4 | 0 | 4 |
 | widened_glob | 4 | 0 | 4 |
 | expired_token | 4 | 0 | 4 |
-| exhausted_max_calls | 4 | 0 | 7 |
-| replayed_discharge | 4 | 0 | 9 |
+| exhausted_max_calls | 5 | 0 | 9 |
+| replayed_discharge | 5 | 0 | 10 |
 | injection_read | 4 | 0 | 5 |
 | injection_exfiltration | 4 | 0 | 4 |
 | injection_destructive | 3 | 0 | 3 |
 | verb_escalation | 2 | 0 | 2 |
 | discharge_misuse | 3 | 0 | 3 |
 | token_tampering | 4 | 0 | 5 |
-| **total** | 40 | 0 | 50 |
+| **total** | 42 | 0 | 53 |
 
-Scenarios with at least one unauthorized effect: broker 0/40, ambient keys 40/40.
+Scenarios with at least one unauthorized effect: broker 0/42, ambient keys 42/42.
 Utility: 30/30 benign tasks completed under least-privilege tokens (ambient keys: 30/30).
 
 Effects are counted at the fake services, not in agent logs. The ambient baseline runs the same
 scripts with the service keys in the host process; it completes the benign tasks too, so least
-privilege cost no utility on this task set. The scenarios are scripted and written by the author of
-the broker: they show that the enumerated attack patterns are contained, not that no other attack
-exists.
+privilege cost no utility on this task set. Two scenarios combine attenuation with clock jumps past
+the state store's grace period: a one-second child token exhausts the shared counter and the parent
+retries later (`short-lived-child-cannot-reset-counter`), and a discharge is used with a one-second
+expiry appended, then the original is replayed later (`attenuated-discharge-outlives-nonce`). The
+scenarios are scripted and written by the author of the broker: they show that the enumerated attack
+patterns are contained, not that no other attack exists.
 
-### Latency
+### Latency (median over 3 repeats)
 
-| benchmark | runs | p50 (us) | p99 (us) | mean (us) |
-|---|---:|---:|---:|---:|
-| verify_10_caveats | 5000 | 159.7 | 827.6 | 186.0 |
-| decide_write_with_discharge | 2500 | 470.5 | 2094.6 | 551.3 |
-| broker_call_in_process | 1000 | 9429.7 | 20050.8 | 9871.3 |
-| broker_call_no_audit | 1000 | 581.2 | 1885.3 | 651.7 |
-| broker_call_http | 300 | 2888.3 | 4869.3 | 3129.8 |
+| benchmark | calls per repeat | repeats | p50 (us) | p99 (us) | p99 range (us) | mean (us) |
+|---|---:|---:|---:|---:|---:|---:|
+| verify_10_caveats | 5000 | 3 | 158.6 | 366.7 | 333.8 to 392.8 | 170.2 |
+| decide_write_with_discharge | 2500 | 3 | 472.8 | 1213.7 | 1130.9 to 1774.8 | 506.7 |
+| broker_call_in_process | 1000 | 3 | 17702.2 | 29478.8 | 28843.7 to 30444.6 | 18248.1 |
+| broker_call_no_audit | 1000 | 3 | 594.9 | 1247.1 | 1131.9 to 1475.0 | 641.4 |
+| broker_call_http | 300 | 3 | 2995.4 | 4480.3 | 4013.9 to 5476.2 | 3194.3 |
 
-`verify_10_caveats` (parse and verify a 10-caveat token) meets the p99 < 2 ms target.
-`broker_call_in_process` includes an fsync'ed audit append per call, which dominates on this
-Windows machine; `broker_call_no_audit` is the same call without the audit log.
-`broker_call_http` goes through the FastAPI app in-process (no network) and does not write an
-audit log. Services are in-process fakes, so these are broker overheads, not end-to-end API
-latencies.
+Each benchmark is repeated three times; the table shows the median of the per-repeat p50, p99 and
+mean, and the lowest and highest per-repeat p99. p99 values move by tens of percent between
+repeats on this machine, so the range is the number to quote, not a single p99.
+`verify_10_caveats` (parse and verify a 10-caveat token) meets the p99 < 2 ms target in every
+repeat. `broker_call_in_process` includes two fsync'ed audit appends per call (the write-ahead
+`broker.authorize` record and the `broker.execute` outcome), which dominate on this Windows
+machine; `broker_call_no_audit` is the same call without the audit log. `broker_call_http` goes
+through the FastAPI app in-process (no network) and does not write an audit log. Services are
+in-process fakes, so these are broker overheads, not end-to-end API latencies.
 
 ## Security
 
