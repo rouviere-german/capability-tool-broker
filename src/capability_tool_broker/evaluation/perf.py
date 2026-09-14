@@ -4,7 +4,8 @@
 - ``decide_write_with_discharge``: every stateless broker check for a write with a bound approval
   discharge (manifest, canonical request, chain, discharge binding, caveats, authority tag);
 - ``broker_call_in_process``: a full allowed read through the broker, including state commit,
-  request signing, the fake service and an fsync'ed audit append;
+  request signing, the fake service and two fsync'ed audit appends (the write-ahead
+  ``broker.authorize`` record and the ``broker.execute`` outcome);
 - ``broker_call_no_audit``: the same without the audit log, to separate its cost;
 - ``broker_call_http``: the same over the broker's FastAPI app (in-process ASGI transport) with a
   fresh EdDSA client assertion per request.
